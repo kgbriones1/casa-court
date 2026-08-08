@@ -36,6 +36,7 @@ button{display:inline-flex;align-items:center;justify-content:center;gap:6px;bor
 button:not(.secondary):not(.small){background:var(--gradient);border-color:var(--coral);color:#fff}
 button.secondary{background:#fff;border-color:var(--line);color:var(--ink)}
 button.small{padding:6px 10px;font-size:11px;border-radius:7px}
+button.small:not(.secondary){background:var(--gradient);border-color:var(--coral);color:#fff}
 button:disabled{opacity:.45;cursor:not-allowed}
 
 .grid{display:grid;gap:14px}
