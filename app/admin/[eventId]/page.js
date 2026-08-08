@@ -2,7 +2,7 @@
 import { useEffect, useState, useMemo, useRef } from "react";
 import TopBar from "../../../components/TopBar";
 import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore } from "../../../lib/db";
-import { generateDraft, swapPlayers, suggestCourtSplit } from "../../../lib/scheduler";
+import { generateDraft, swapPlayers, suggestCourtSplit, eligiblePlayersByGender } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
 const ATT_COLOR = { not_arrived: "#8a8067", late: "#b58a2f", checked_in: "#2c6e3f", temporarily_unavailable: "#4C6E91", no_show: "#a83232", withdrawn: "#5b5142" };
@@ -21,6 +21,120 @@ function leaderboardFor(players, gender) {
   return { sorted, tied: tied.length > 1 ? tied : null };
 }
 
+/** Same math as capacityPreview() in app/admin/page.js, but returning numbers instead
+ * of a sentence -- used for the Dashboard's capacity tiles, which need the raw figures
+ * (planned rounds, planned matches, estimated games/player) to compare against actuals. */
+function computeCapacity(event, registeredCount) {
+  if (!event.start_time || !event.end_time) return null;
+  const [sh, sm] = event.start_time.split(":").map(Number);
+  const [eh, em] = event.end_time.split(":").map(Number);
+  const mins = (eh * 60 + em) - (sh * 60 + sm);
+  if (!Number.isFinite(mins) || mins <= 0) return null;
+  const roundMinutes = event.round_minutes || 20;
+  const plannedRounds = Math.floor(mins / roundMinutes);
+  const plannedMatches = plannedRounds * event.courts;
+  const base = event.target_participants || registeredCount;
+  const estGamesPerPlayer = base ? (plannedMatches * 4) / base : null;
+  return { mins, roundMinutes, plannedRounds, plannedMatches, estGamesPerPlayer };
+}
+
+/** Audits the event's actual published/scored data (not a simulation) against the same
+ * rules lib/scheduler.test.js checks against a synthetic run. History integrity and the
+ * checked_in-only eligibility rule aren't included here -- attendance status is mutable
+ * after the fact, so re-checking it retroactively would be misleading; those two are
+ * covered by the automated suite (npm test) instead, which controls for that. */
+function auditReport(players, roundsWithMatches) {
+  const activeRounds = roundsWithMatches
+    .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "cancelled") }))
+    .filter((r) => r.matches.length > 0)
+    .sort((a, b) => a.number - b.number);
+
+  if (activeRounds.length === 0) return [];
+
+  const byId = Object.fromEntries(players.map((p) => [p.id, p]));
+  const rows = [];
+
+  let genderViolations = 0;
+  activeRounds.forEach((r) => r.matches.forEach((m) => {
+    const genders = new Set([...m.team_a, ...m.team_b].map((id) => byId[id]?.gender));
+    if (genders.size !== 1) genderViolations++;
+  }));
+  rows.push({
+    rule: "Strict gender segregation",
+    result: genderViolations === 0 ? "pass" : "fail",
+    finding: genderViolations === 0 ? "Every match's four players share one gender." : `${genderViolations} match(es) found mixing genders.`,
+  });
+
+  const partnerPairs = { female: new Map(), male: new Map() };
+  activeRounds.forEach((r) => r.matches.forEach((m) => {
+    [m.team_a, m.team_b].forEach(([p1, p2]) => {
+      const key = [p1, p2].sort().join("|");
+      partnerPairs[m.division].set(key, (partnerPairs[m.division].get(key) || 0) + 1);
+    });
+  }));
+  const totalPartnerships = [...partnerPairs.female.values(), ...partnerPairs.male.values()].reduce((a, b) => a + b, 0);
+  const repeatedPartnerships = [...partnerPairs.female.values(), ...partnerPairs.male.values()].filter((c) => c > 1).length;
+  rows.push({
+    rule: "No repeat partners",
+    result: repeatedPartnerships === 0 ? "pass" : "warn",
+    finding: repeatedPartnerships === 0
+      ? `0 repeated partnerships across ${totalPartnerships} pairings.`
+      : `${repeatedPartnerships} repeated partnership(s) across ${totalPartnerships} pairings -- expected only once a division's partner pool is exhausted (check the Event Log for that warning).`,
+  });
+
+  let backToBack = 0;
+  for (let i = 1; i < activeRounds.length; i++) {
+    const prevIds = new Set(activeRounds[i - 1].matches.flatMap((m) => [...m.team_a, ...m.team_b]));
+    new Set(activeRounds[i].matches.flatMap((m) => [...m.team_a, ...m.team_b])).forEach((id) => { if (prevIds.has(id)) backToBack++; });
+  }
+  rows.push({
+    rule: "Avoid back-to-back rounds",
+    result: backToBack === 0 ? "pass" : "warn",
+    finding: backToBack === 0 ? "No player appeared in two consecutive rounds." : `${backToBack} player-appearance(s) were back-to-back -- expected only when resting would drop a division below 4 eligible.`,
+  });
+
+  const played = players.filter((p) => p.games_played > 0);
+  const counts = played.map((p) => p.games_played);
+  const spread = counts.length ? Math.max(...counts) - Math.min(...counts) : 0;
+  rows.push({
+    rule: "Balance games played",
+    result: !counts.length ? "n/a" : spread <= 1 ? "pass" : spread <= 2 ? "warn" : "fail",
+    finding: counts.length ? `Spread of ${spread} game(s) across ${played.length} players who've played (min ${Math.min(...counts)}, max ${Math.max(...counts)}).` : "No scored games yet.",
+  });
+
+  ["female", "male"].forEach((g) => {
+    let total = 0;
+    const seen = new Map();
+    activeRounds.forEach((r) => r.matches.forEach((m) => {
+      if (m.division !== g) return;
+      m.team_a.forEach((a) => m.team_b.forEach((b) => {
+        total++;
+        const key = [a, b].sort().join("|");
+        seen.set(key, (seen.get(key) || 0) + 1);
+      }));
+    }));
+    const repeats = [...seen.values()].filter((c) => c > 1).length;
+    rows.push({
+      rule: `Minimize repeat opponents (${g === "female" ? "women's" : "men's"} doubles)`,
+      result: total === 0 ? "n/a" : repeats / total < 0.2 ? "pass" : "warn",
+      finding: total === 0 ? "No matches yet." : `${repeats} repeated opponent pairing(s) out of ${total}.`,
+    });
+  });
+
+  const avg = (arr) => (arr.length ? arr.reduce((s, p) => s + p.games_played, 0) / arr.length : 0);
+  const womenPlayed = played.filter((p) => p.gender === "female");
+  const menPlayed = played.filter((p) => p.gender === "male");
+  rows.push({
+    rule: "Pacing between divisions",
+    result: !womenPlayed.length || !menPlayed.length ? "n/a" : Math.abs(avg(womenPlayed) - avg(menPlayed)) < 1 ? "pass" : "warn",
+    finding: !womenPlayed.length || !menPlayed.length ? "Need games in both divisions to compare pacing." : `Average games played: ${avg(womenPlayed).toFixed(1)} (women) vs ${avg(menPlayed).toFixed(1)} (men).`,
+  });
+
+  return rows;
+}
+
+const AUDIT_BADGE = { pass: "green", warn: "amber", fail: "red", "n/a": "gray" };
+
 function AdminInner({ eventId }) {
   const [state, setState] = useState(null); // {event, players, rounds, matches}
   const [tab, setTab] = useState("dashboard");
@@ -28,6 +142,8 @@ function AdminInner({ eventId }) {
   const [genError, setGenError] = useState("");
   const [busy, setBusy] = useState(false);
   const [courtSplit, setCourtSplit] = useState(null); // organizer override of the suggested women/men court split; null = use suggestion
+  const [origin, setOrigin] = useState("");
+  const [copied, setCopied] = useState(false);
 
   const reload = () => eventId && fetchFullEvent(eventId).then(setState);
 
@@ -36,6 +152,7 @@ function AdminInner({ eventId }) {
     if (!eventId) return;
     return subscribeEvent(eventId, reload);
   }, [eventId]);
+  useEffect(() => { setOrigin(window.location.origin); }, []);
 
   if (!eventId) return <div className="wrap"><div className="card">Missing event -- open this page from the Event Manager.</div></div>;
   if (!state?.event) return <div className="wrap"><div className="card">Loading...</div></div>;
@@ -46,9 +163,14 @@ function AdminInner({ eventId }) {
   const lastPublished = roundsWithMatches[roundsWithMatches.length - 1];
   const justPlayedIds = lastPublished ? new Set(lastPublished.matches.flatMap((m) => [...m.team_a, ...m.team_b])) : new Set();
   const checkedInCount = players.filter((p) => p.attendance_status === "checked_in").length;
+  const completedRoundsCount = roundsWithMatches.filter((r) => r.matches.every((m) => m.status !== "scheduled")).length;
+  const capacity = computeCapacity(event, players.length);
+  const auditRows = auditReport(players, roundsWithMatches);
+  const participantUrl = `${origin}${BASE_PATH}/live/${eventId}`;
 
-  const eligibleFemalePlayers = players.filter((p) => p.attendance_status === "checked_in" && p.gender === "female" && !justPlayedIds.has(p.id));
-  const eligibleMalePlayers = players.filter((p) => p.attendance_status === "checked_in" && p.gender === "male" && !justPlayedIds.has(p.id));
+  const { eligibleByGender } = eligiblePlayersByGender(players, new Set(), justPlayedIds);
+  const eligibleFemalePlayers = eligibleByGender.female;
+  const eligibleMalePlayers = eligibleByGender.male;
   const eligibleFemale = eligibleFemalePlayers.length;
   const eligibleMale = eligibleMalePlayers.length;
   const suggestedSplit = suggestCourtSplit(eligibleFemalePlayers, eligibleMalePlayers, event.courts);
@@ -107,6 +229,28 @@ function AdminInner({ eventId }) {
                 </div>
               </div>
             </div>
+
+            <div className="grid metrics">
+              <div className="card"><div className="small">Participant target</div><div className="metric">{event.target_participants ?? "--"}</div></div>
+              <div className="card"><div className="small">Registered</div><div className="metric">{players.length}</div></div>
+              <div className="card"><div className="small">Checked in</div><div className="metric">{checkedInCount}</div></div>
+              <div className="card"><div className="small">Completed rounds</div><div className="metric">{completedRoundsCount}/{capacity ? capacity.plannedRounds : rounds.length}</div></div>
+              <div className="card"><div className="small">Event duration</div><div className="metric">{capacity ? `${capacity.mins} min` : "--"}</div></div>
+              <div className="card"><div className="small">Courts occupied</div><div className="metric">{event.courts}</div></div>
+              <div className="card"><div className="small">{capacity ? `${capacity.roundMinutes}-minute rounds` : "Planned rounds"}</div><div className="metric">{capacity ? capacity.plannedRounds : "--"}</div></div>
+              <div className="card"><div className="small">Estimated games / player</div><div className="metric">{capacity?.estGamesPerPlayer != null ? capacity.estGamesPerPlayer.toFixed(1) : "--"}</div></div>
+            </div>
+
+            <div className="card">
+              <h2>Participant URL</h2>
+              <p className="note">Unique read-only link for this event -- no login, no self check-in.</p>
+              <div className="row">
+                <input readOnly value={participantUrl} onFocus={(e) => e.target.select()} style={{ flex: 1, minWidth: 220 }} />
+                <button className="small secondary" onClick={() => { navigator.clipboard.writeText(participantUrl); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>{copied ? "Copied!" : "Copy participant link"}</button>
+                <button className="small" onClick={() => window.open(`${BASE_PATH}/live/${eventId}`, "_blank", "noopener,noreferrer")}>Open participant view</button>
+              </div>
+            </div>
+
             <div className="card">
               <h2>Leaders (provisional)</h2>
               {["male", "female"].map((g) => {
@@ -119,6 +263,31 @@ function AdminInner({ eventId }) {
                 );
               })}
             </div>
+
+            <div className="card">
+              <h2>Algorithm audit</h2>
+              <p className="note">Checks the actual published/scored matches against the matchmaking rules -- not a simulation.</p>
+              {auditRows.length === 0 ? (
+                <p className="note">Publish and play at least one round to see an audit.</p>
+              ) : (
+                <div className="tablewrap">
+                  <table>
+                    <thead><tr><th>Rule</th><th>Result</th><th>Finding</th></tr></thead>
+                    <tbody>
+                      {auditRows.map((r, i) => (
+                        <tr key={i}>
+                          <td>{r.rule}</td>
+                          <td><span className={`badge ${AUDIT_BADGE[r.result]}`}>{r.result}</span></td>
+                          <td className="small">{r.finding}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              <p className="note" style={{ marginTop: 8 }}>History integrity and the checked-in-only eligibility rule are covered separately by the automated regression suite (<code>npm test</code>), not this live audit.</p>
+            </div>
+
             <div className="card" style={{ borderColor: "#efc3c0" }}>
               <h2 style={{ color: "#993d38" }}>Danger zone</h2>
               <p className="note">Deletes this event and everything in it -- players, rounds, matches, scores, logs. Cannot be undone.</p>

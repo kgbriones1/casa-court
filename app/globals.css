@@ -46,7 +46,7 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .metric{font-size:28px;font-weight:900;margin-top:7px}
 
 .badge,.pill{display:inline-flex;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:800;background:#f0eee9}
-.badge.green,.pill.green{background:#eef4ff;color:#4a5fae}
+.badge.green,.pill.green{background:#eaf6ec;color:#2c6e3f}
 .badge.amber,.pill.amber{background:#fff1e3;color:#9a5a23}
 .badge.red,.pill.red{background:#fdebea;color:#9c3d38}
 .badge.blue,.pill.blue{background:#eef4ff;color:#4a5fae}
