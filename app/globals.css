@@ -129,7 +129,7 @@ input,select,textarea{border:1px solid var(--line);border-radius:9px;padding:9px
   .layout{grid-template-columns:1fr}
   aside{width:100%;border-right:0;border-bottom:1px solid var(--line)}
   .nav{display:flex;gap:6px;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:2px}
-  .nav button{white-space:nowrap;margin:0}
+  .nav button{display:inline-block;width:auto;flex-shrink:0;white-space:nowrap;margin:0}
   main,.main{padding:16px}
   .head{flex-direction:column}
   .event-list{grid-template-columns:1fr}
