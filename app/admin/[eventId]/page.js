@@ -2,7 +2,7 @@
 import { useEffect, useState, useMemo, useRef } from "react";
 import TopBar from "../../../components/TopBar";
 import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore } from "../../../lib/db";
-import { generateDraft, swapPlayers, eligiblePlayers, typeCoverage, matchTypeLabel } from "../../../lib/scheduler";
+import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
 const ATT_COLOR = { not_arrived: "#8a8067", late: "#b58a2f", checked_in: "#2c6e3f", temporarily_unavailable: "#4C6E91", no_show: "#a83232", withdrawn: "#5b5142" };
@@ -43,7 +43,7 @@ function computeCapacity(event, registeredCount) {
  * checked_in-only eligibility rule aren't included here -- attendance status is mutable
  * after the fact, so re-checking it retroactively would be misleading; those two are
  * covered by the automated suite (npm test) instead, which controls for that. */
-function auditReport(players, roundsWithMatches, event) {
+function auditReport(players, roundsWithMatches) {
   const activeRounds = roundsWithMatches
     .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "cancelled") }))
     .filter((r) => r.matches.length > 0)
@@ -53,29 +53,6 @@ function auditReport(players, roundsWithMatches, event) {
 
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));
   const rows = [];
-
-  // The hard rule since mixed doubles were introduced: not "never mix genders" (that's
-  // gone) but "every player who's actually played has tried every type applicable to
-  // them" -- women's/mixed for women, men's/mixed for men. Mid-event this is still
-  // being worked toward, so it's a warning naming the gaps; only fails once the event
-  // has ended and gaps remain, since by then there are no more rounds to fix it.
-  const coverageGaps = players
-    .filter((p) => p.games_played > 0)
-    .map((p) => {
-      const { own, mixed } = typeCoverage(p, byId);
-      const missing = [];
-      if (own === 0) missing.push(p.gender === "female" ? "women's" : "men's");
-      if (mixed === 0) missing.push("mixed");
-      return { p, missing };
-    })
-    .filter((x) => x.missing.length > 0);
-  rows.push({
-    rule: "Every active player has tried each required match type",
-    result: coverageGaps.length === 0 ? "pass" : event.ended ? "fail" : "warn",
-    finding: coverageGaps.length === 0
-      ? `All ${players.filter((p) => p.games_played > 0).length} players who've played have experienced every type applicable to them.`
-      : `${coverageGaps.length} player(s) with games played still missing a type: ${coverageGaps.map(({ p, missing }) => `${p.display_name} (needs ${missing.join(" & ")})`).join(", ")}.`,
-  });
 
   // Partnerships and opponent-meetings are tracked per player-pair regardless of
   // match type (mirrors partner_ids/opponent_counts, which are flat, not split by
@@ -105,7 +82,7 @@ function auditReport(players, roundsWithMatches, event) {
   rows.push({
     rule: "Avoid back-to-back rounds",
     result: backToBack === 0 ? "pass" : "warn",
-    finding: backToBack === 0 ? "No player appeared in two consecutive rounds." : `${backToBack} player-appearance(s) were back-to-back -- expected only when resting would drop a division below 4 eligible.`,
+    finding: backToBack === 0 ? "No player appeared in two consecutive rounds." : `${backToBack} player-appearance(s) were back-to-back -- expected only when resting would drop the eligible pool below 4.`,
   });
 
   const played = players.filter((p) => p.games_played > 0);
@@ -150,15 +127,6 @@ function auditReport(players, roundsWithMatches, event) {
     rule: "Minimize repeat opponents",
     result: totalOpponentPairs === 0 ? "n/a" : repeatedOpponents / totalOpponentPairs < 0.2 ? "pass" : "warn",
     finding: totalOpponentPairs === 0 ? "No matches yet." : `${repeatedOpponents} repeated opponent pairing(s) out of ${totalOpponentPairs}.`,
-  });
-
-  const edgeMatches = activeRounds.flatMap((r) => r.matches).filter((m) => m.division === "edge");
-  rows.push({
-    rule: "Avoid edge (uneven) match compositions",
-    result: edgeMatches.length === 0 ? "pass" : "warn",
-    finding: edgeMatches.length === 0
-      ? "Every match was a clean women's, men's, or mixed doubles composition."
-      : `${edgeMatches.length} match(es) used an edge composition (an uneven gender split) because supply didn't divide cleanly -- expected only as a last resort.`,
   });
 
   const avg = (arr) => (arr.length ? arr.reduce((s, p) => s + p.games_played, 0) / arr.length : 0);
@@ -212,7 +180,7 @@ function AdminInner({ eventId }) {
   const checkedInCount = players.filter((p) => p.attendance_status === "checked_in").length;
   const completedRoundsCount = roundsWithMatches.filter((r) => r.matches.every((m) => m.status !== "scheduled")).length;
   const capacity = computeCapacity(event, players.length);
-  const auditRows = auditReport(players, roundsWithMatches, event);
+  const auditRows = auditReport(players, roundsWithMatches);
   const participantUrl = `${origin}${BASE_PATH}/live/${eventId}`;
 
   const { pool: eligiblePool } = eligiblePlayers(players, new Set(), justPlayedIds);
@@ -221,19 +189,31 @@ function AdminInner({ eventId }) {
 
   const generate = async () => {
     setGenError(""); setBusy(true);
-    const roundNumber = rounds.length + 1;
-    const res = generateDraft(players, event.courts, roundNumber, new Set(), justPlayedIds);
-    setBusy(false);
-    if (res.error) return setGenError(res.error);
-    setDraft(res);
+    try {
+      const roundNumber = rounds.length + 1;
+      const res = generateDraft(players, event.courts, roundNumber, new Set(), justPlayedIds);
+      if (res.error) { setGenError(res.error); return; }
+      setDraft(res);
+    } finally {
+      setBusy(false);
+    }
   };
 
+  // Must not let a Supabase failure (e.g. a schema mismatch) leave busy stuck true
+  // forever with no explanation -- that reads as "generation just doesn't work."
+  // The draft is left in place on failure so nothing generated is lost; Cancel
+  // draft is always available as an escape hatch regardless of busy state.
   const publish = async () => {
-    setBusy(true);
-    await publishRound(eventId, draft.roundNumber, draft.matches, players);
-    setDraft(null);
-    setBusy(false);
-    reload();
+    setGenError(""); setBusy(true);
+    try {
+      await publishRound(eventId, draft.roundNumber, draft.matches, players);
+      setDraft(null);
+      reload();
+    } catch (err) {
+      setGenError(`Publish failed: ${err.message || err}. The draft is unchanged -- fix the issue and try again, or cancel the draft.`);
+    } finally {
+      setBusy(false);
+    }
   };
 
   return (
@@ -574,7 +554,7 @@ function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish,
     <>
       <div className="card">
         <h2>Round generation</h2>
-        {!draft && <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible this round. Courts are assigned automatically across women's, men's, and mixed doubles -- whichever type still has players missing their first experience of it gets priority, then pacing.</p>}
+        {!draft && <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible this round ({eligibleFemale + eligibleMale} total). Matchmaking is gender-blind -- anyone can be partnered with or matched against anyone, based on balance, rest, and never repeating a partner.</p>}
         {draft ? (
           <>
             <p className="note" style={{ fontFamily: "monospace", color: "#4C6E91" }}>DRAFT -- ROUND {draft.roundNumber} -- NOT PUBLISHED</p>
@@ -593,7 +573,7 @@ function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish,
         ) : (
           <button onClick={generate} disabled={busy}>Generate draft round {rounds.length + 1}</button>
         )}
-        {genError && <p className="note">{genError}</p>}
+        {genError && <div className="error-box">{genError}</div>}
       </div>
 
       {[...roundsWithMatches].reverse().map((r) => (
