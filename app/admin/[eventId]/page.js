@@ -206,6 +206,7 @@ function AdminInner({ eventId }) {
       <TopBar
         title={event.name}
         subtitle={`${event.ended ? "EVENT ENDED" : event.started_at ? `LIVE \u00B7 ROUND ${rounds.length}` : "NOT STARTED"} \u00B7 ${event.courts} courts`}
+        linkHome
       />
       <div className="layout">
         <aside>
