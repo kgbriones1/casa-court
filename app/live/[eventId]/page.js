@@ -2,6 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import TopBar from "../../../components/TopBar";
 import { fetchFullEvent, subscribeEvent } from "../../../lib/db";
+import { matchTypeLabel } from "../../../lib/scheduler";
 
 function leaderboardFor(players, gender) {
   const list = gender === "overall" ? players : players.filter((p) => p.gender === gender);
@@ -39,7 +40,7 @@ function MatchRow({ byId, m, highlightId }) {
   const involves = highlightId && [...m.team_a, ...m.team_b].includes(highlightId);
   return (
     <div className="court" style={{ outline: involves ? "3px solid #c8923e" : "none" }}>
-      <div className="label">Court {m.court}{m.division && <span> &middot; {m.division === "female" ? "Women's Doubles" : "Men's Doubles"}</span>}</div>
+      <div className="label">Court {m.court} &middot; {matchTypeLabel(m, byId)}</div>
       <div className="teams">
         <div className="team">{m.team_a.map(name).join(" & ")}</div>
         <div className="vs">VS</div>

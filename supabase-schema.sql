@@ -57,7 +57,9 @@ create table matches (
   round_id uuid not null references rounds(id) on delete cascade,
   event_id uuid not null references events(id) on delete cascade, -- denormalized, simplifies realtime filtering
   court int not null,
-  division text not null default 'male' check (division in ('female','male')), -- women's doubles / men's doubles, never mixed
+  division text not null default 'men' check (division in ('women','men','mixed','edge')),
+    -- women's/men's doubles, mixed doubles, or an edge composition (uneven gender
+    -- split, or a same-gender-pair-vs-same-gender-pair fallback) -- see lib/scheduler.js
   team_a uuid[] not null,
   team_b uuid[] not null,
   score_a int,

@@ -19,11 +19,12 @@ reflects the kind of gender skew to expect at a real event.
 - Add walk-in registrants on the spot, same fields as pre-registered.
 - Generate match rounds that respect the full ruleset (below), via **Draft → Review → Publish** —
   nothing commits to partner/opponent history until explicitly published.
-- Have match generation be strictly gender-segregated: women's doubles and men's doubles, never
-  mixed. Control how many courts go to each division per round (with a sensible pacing-based
-  default, overridable).
+- Match generation may produce women's doubles, men's doubles, **or mixed doubles** (one woman +
+  one man per team) — no longer strictly segregated. Court-type allocation per round is fully
+  automatic (need-aware, then pacing-aware); there's no manual per-division court-count override.
 - Be warned, not silently blocked, when a constraint can't be perfectly honored (e.g. rest gap
-  relaxed due to low attendance, a division's partner pool exhausted) — event should keep moving.
+  relaxed due to low attendance, the partner pool exhausted, or an uneven gender split forcing an
+  "edge" composition) — event should keep moving.
 - Enter scores per individual match (not per round), each entry identifying court, division, and
   both teams by name.
 - Correct a previously entered score with stats properly reversed and reapplied, and logged.
@@ -55,31 +56,65 @@ reflects the kind of gender skew to expect at a real event.
 
 ## 2. Business Logic & Workflow
 
-**Format:** Doubles, strictly gender-segregated. Individual ranking by cumulative point
-differential across all matches — not win/loss. Wins/losses are reference-only. Awards: King
-(top male differential), Queen (top female differential). No 2nd/3rd place awards. A first-place
-tie within a gender is resolved by an off-system singles tiebreaker. Hard 4-hour event window —
-whatever's mid-match when time expires is finalized at the current score ("time expired" status).
+**Format:** Doubles. As of the mixed-doubles redesign, a match can be women's doubles, men's
+doubles, or mixed (each team is one woman + one man) — no longer strictly segregated. Individual
+ranking by cumulative point differential across all matches — not win/loss. Wins/losses are
+reference-only. Awards: King (top male differential), Queen (top female differential). No 2nd/3rd
+place awards. A first-place tie within a gender is resolved by an off-system singles tiebreaker.
+Hard 4-hour event window — whatever's mid-match when time expires is finalized at the current
+score ("time expired" status).
+
+**Match type coverage (the rule that replaced strict segregation):** No longer a hard rule that
+every match must be single-gender. Instead, the one hard rule is that every player must, by the
+end of the event, have tried every type applicable to their gender — women's doubles AND mixed for
+women; men's doubles AND mixed for men. Enforced best-effort via a strong priority bonus during
+round generation (`lib/scheduler.js`'s `NEEDS_COVERAGE_BONUS`), not a strict generation-time
+filter, so it's checked after the fact — see the Dashboard's "Every active player has tried each
+required match type" audit row, which warns mid-event and fails only if gaps remain after the
+event has ended. Beyond that minimum, balancing how evenly a player's matches split across
+applicable types is a soft, best-effort goal, not required.
+
+**Edge compositions (last resort only):** When the eligible pool for a round doesn't divide
+cleanly into women's/men's/mixed groups (an uneven 3-1 gender split), the algorithm falls back to
+an "edge" match rather than benching everyone involved — e.g. a mixed pair vs. a same-gender pair.
+Within an otherwise-clean 2-women/2-men group, the algorithm can also fall back to a same-gender-
+pair-vs-same-gender-pair split instead of proper mixed pairs, but only if that avoids a repeat
+partnership that the mixed pairing would otherwise force — penalized heavily (`EDGE_SPLIT` in the
+cost function) so it's only chosen when nothing cleaner works. Both cases log a warning. Tested
+empirically at 0% edge usage on the 30-player/6-women/24-men/3-court/16-round reference scenario —
+it's a genuine fallback, not a routine occurrence.
 
 **Matchmaking priority order** (highest to lowest):
 1. **Never repeat partners** — hard constraint (very large penalty in the cost function). Only
-   relaxed, with a warning, when a division's pool of unique partner-pairs is mathematically
-   exhausted (this happens fast with small divisions — 6 players only supports 15 unique pairs).
+   relaxed, with a warning, when the pool of unique partner-pairs available to a player is
+   mathematically exhausted (this happens fast with small pools — 6 players only supports 15
+   unique pairs).
 2. **Rest gap** — a player shouldn't play two rounds back-to-back. Hard-excluded by default;
    automatically relaxed (with a warning) only if enforcing it would leave fewer than 4 eligible
-   players in that division for the round.
-3. **Balance games played / prioritize longest-waiting and latecomers** — priority score weighted
+   players overall for the round (checked across the whole pool, not per gender, now that mixed
+   doubles removes the need for two separate per-gender thresholds).
+3. **Match-type coverage** — see above. A player who hasn't yet had their first experience of a
+   required type gets a strong priority bonus toward being selected into a court of that type.
+4. **Balance games played / prioritize longest-waiting and latecomers** — priority score weighted
    heavily toward fewest games played, with a wait-time bonus and an extra bonus for players with
    zero games (so late arrivals get folded into rotation quickly rather than queued behind
    everyone).
-4. **Minimize repeat opponents** — soft constraint, penalized per prior meeting, never eliminated.
-5. **Avoid back-to-back play as a secondary nudge** — folded into the same cost function alongside
+5. **Prefer clean compositions over edge fallbacks** — see above; only overridden by priority #1.
+6. **Minimize repeat opponents** — soft constraint, penalized per prior meeting, never eliminated.
+   Mixed doubles substantially widens the opponent pool for smaller-division players (a woman's
+   opponents are no longer only other women) — measured at ~8% repeat-opponent rate on the
+   reference scenario, down from ~35%+ under strict segregation.
+7. **Avoid back-to-back play as a secondary nudge** — folded into the same cost function alongside
    priority #2's hard exclusion.
-6. **Keep court utilization high** — courts-per-gender split is *pacing-aware*, not just
-   proportional to headcount: each round, the next available court goes to whichever division is
-   currently behind on average games played. This is what keeps a small division (e.g. 6 women vs
-   24 men) from either starving or blowing past the other division's pace.
-7. **Integrate late arrivals fairly** — covered by the zero-games priority bonus in #3.
+8. **Keep court utilization high** — court-type allocation per round (`planCourts` in
+   `lib/scheduler.js`) is need-aware first (whichever feasible type has the most players still
+   missing their first experience of it), then pacing-aware (lower average games played in that
+   type's relevant pool) once coverage needs are satisfied.
+9. **Integrate late arrivals fairly** — covered by the zero-games priority bonus in #4.
+
+There is no manual per-round court-type override in the UI (the old "courts for women / courts for
+men" inputs were removed) — court-type allocation is fully automatic given the added complexity of
+three (or four, counting edge) possible types instead of two.
 
 **Draft → Review → Publish:** Generating a round only produces a client-side draft — nothing is
 written to the database. **Publishing is the actual commit point**: this is when partner history,
@@ -145,9 +180,12 @@ unrelated repo once — worth double-checking any new deploy is sourced from `ca
   any further UI work unless told otherwise.
 
 **Database:** `supabase-schema.sql` is the full schema. `supabase-migration-2.sql` (adds event
-capacity fields + the `logs` table) and `supabase-migration-3.sql` (adds `division` to `matches`)
-are incremental — already applied to the live Supabase project, but worth knowing they exist as
-separate files if a fresh environment ever needs setting up from scratch.
+capacity fields + the `logs` table), `supabase-migration-3.sql` (adds `division` to `matches`),
+and `supabase-migration-4.sql` (broadens `division`'s allowed values from `('female','male')` to
+`('women','men','mixed','edge')` for mixed doubles, relabeling existing rows) are incremental.
+**Migration 4 must be run on the live Supabase project before publishing any round with the mixed-
+doubles algorithm** — the old CHECK constraint would otherwise reject the insert. 2 and 3 were
+already applied as of the last handoff; confirm 4's status before assuming it's done.
 
 **Environment variables:** `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` — required.
 `NEXT_PUBLIC_BASE_PATH` — optional, only used if deploying under a subpath (e.g.

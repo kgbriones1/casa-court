@@ -2,7 +2,7 @@
 import { useEffect, useState, useMemo, useRef } from "react";
 import TopBar from "../../../components/TopBar";
 import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore } from "../../../lib/db";
-import { generateDraft, swapPlayers, suggestCourtSplit, eligiblePlayersByGender } from "../../../lib/scheduler";
+import { generateDraft, swapPlayers, eligiblePlayers, typeCoverage, matchTypeLabel } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
 const ATT_COLOR = { not_arrived: "#8a8067", late: "#b58a2f", checked_in: "#2c6e3f", temporarily_unavailable: "#4C6E91", no_show: "#a83232", withdrawn: "#5b5142" };
@@ -43,7 +43,7 @@ function computeCapacity(event, registeredCount) {
  * checked_in-only eligibility rule aren't included here -- attendance status is mutable
  * after the fact, so re-checking it retroactively would be misleading; those two are
  * covered by the automated suite (npm test) instead, which controls for that. */
-function auditReport(players, roundsWithMatches) {
+function auditReport(players, roundsWithMatches, event) {
   const activeRounds = roundsWithMatches
     .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "cancelled") }))
     .filter((r) => r.matches.length > 0)
@@ -54,32 +54,47 @@ function auditReport(players, roundsWithMatches) {
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));
   const rows = [];
 
-  let genderViolations = 0;
-  activeRounds.forEach((r) => r.matches.forEach((m) => {
-    const genders = new Set([...m.team_a, ...m.team_b].map((id) => byId[id]?.gender));
-    if (genders.size !== 1) genderViolations++;
-  }));
+  // The hard rule since mixed doubles were introduced: not "never mix genders" (that's
+  // gone) but "every player who's actually played has tried every type applicable to
+  // them" -- women's/mixed for women, men's/mixed for men. Mid-event this is still
+  // being worked toward, so it's a warning naming the gaps; only fails once the event
+  // has ended and gaps remain, since by then there are no more rounds to fix it.
+  const coverageGaps = players
+    .filter((p) => p.games_played > 0)
+    .map((p) => {
+      const { own, mixed } = typeCoverage(p, byId);
+      const missing = [];
+      if (own === 0) missing.push(p.gender === "female" ? "women's" : "men's");
+      if (mixed === 0) missing.push("mixed");
+      return { p, missing };
+    })
+    .filter((x) => x.missing.length > 0);
   rows.push({
-    rule: "Strict gender segregation",
-    result: genderViolations === 0 ? "pass" : "fail",
-    finding: genderViolations === 0 ? "Every match's four players share one gender." : `${genderViolations} match(es) found mixing genders.`,
+    rule: "Every active player has tried each required match type",
+    result: coverageGaps.length === 0 ? "pass" : event.ended ? "fail" : "warn",
+    finding: coverageGaps.length === 0
+      ? `All ${players.filter((p) => p.games_played > 0).length} players who've played have experienced every type applicable to them.`
+      : `${coverageGaps.length} player(s) with games played still missing a type: ${coverageGaps.map(({ p, missing }) => `${p.display_name} (needs ${missing.join(" & ")})`).join(", ")}.`,
   });
 
-  const partnerPairs = { female: new Map(), male: new Map() };
+  // Partnerships and opponent-meetings are tracked per player-pair regardless of
+  // match type (mirrors partner_ids/opponent_counts, which are flat, not split by
+  // division) -- two people either partnered/faced each other or they didn't.
+  const partnerPairs = new Map();
   activeRounds.forEach((r) => r.matches.forEach((m) => {
     [m.team_a, m.team_b].forEach(([p1, p2]) => {
       const key = [p1, p2].sort().join("|");
-      partnerPairs[m.division].set(key, (partnerPairs[m.division].get(key) || 0) + 1);
+      partnerPairs.set(key, (partnerPairs.get(key) || 0) + 1);
     });
   }));
-  const totalPartnerships = [...partnerPairs.female.values(), ...partnerPairs.male.values()].reduce((a, b) => a + b, 0);
-  const repeatedPartnerships = [...partnerPairs.female.values(), ...partnerPairs.male.values()].filter((c) => c > 1).length;
+  const totalPartnerships = [...partnerPairs.values()].reduce((a, b) => a + b, 0);
+  const repeatedPartnerships = [...partnerPairs.values()].filter((c) => c > 1).length;
   rows.push({
     rule: "No repeat partners",
     result: repeatedPartnerships === 0 ? "pass" : "warn",
     finding: repeatedPartnerships === 0
       ? `0 repeated partnerships across ${totalPartnerships} pairings.`
-      : `${repeatedPartnerships} repeated partnership(s) across ${totalPartnerships} pairings -- expected only once a division's partner pool is exhausted (check the Event Log for that warning).`,
+      : `${repeatedPartnerships} repeated partnership(s) across ${totalPartnerships} pairings -- expected only once the partner pool is exhausted (check the Event Log for that warning).`,
   });
 
   let backToBack = 0;
@@ -118,32 +133,41 @@ function auditReport(players, roundsWithMatches) {
     finding: !counts.length ? "No scored games yet." : findingParts.length ? findingParts.join(" -- ") : `All ${played.length} players who've played are within 1 game of the typical ${typical}.`,
   });
 
-  ["female", "male"].forEach((g) => {
-    let total = 0;
-    const seen = new Map();
-    activeRounds.forEach((r) => r.matches.forEach((m) => {
-      if (m.division !== g) return;
-      m.team_a.forEach((a) => m.team_b.forEach((b) => {
-        total++;
-        const key = [a, b].sort().join("|");
-        seen.set(key, (seen.get(key) || 0) + 1);
-      }));
+  // Opponent-meetings are global too, for the same reason as partnerships above --
+  // and mixed doubles gives everyone a bigger pool of possible opponents to draw
+  // from than strict segregation did, so this isn't split by division anymore.
+  let totalOpponentPairs = 0;
+  const opponentSeen = new Map();
+  activeRounds.forEach((r) => r.matches.forEach((m) => {
+    m.team_a.forEach((a) => m.team_b.forEach((b) => {
+      totalOpponentPairs++;
+      const key = [a, b].sort().join("|");
+      opponentSeen.set(key, (opponentSeen.get(key) || 0) + 1);
     }));
-    const repeats = [...seen.values()].filter((c) => c > 1).length;
-    rows.push({
-      rule: `Minimize repeat opponents (${g === "female" ? "women's" : "men's"} doubles)`,
-      result: total === 0 ? "n/a" : repeats / total < 0.2 ? "pass" : "warn",
-      finding: total === 0 ? "No matches yet." : `${repeats} repeated opponent pairing(s) out of ${total}.`,
-    });
+  }));
+  const repeatedOpponents = [...opponentSeen.values()].filter((c) => c > 1).length;
+  rows.push({
+    rule: "Minimize repeat opponents",
+    result: totalOpponentPairs === 0 ? "n/a" : repeatedOpponents / totalOpponentPairs < 0.2 ? "pass" : "warn",
+    finding: totalOpponentPairs === 0 ? "No matches yet." : `${repeatedOpponents} repeated opponent pairing(s) out of ${totalOpponentPairs}.`,
+  });
+
+  const edgeMatches = activeRounds.flatMap((r) => r.matches).filter((m) => m.division === "edge");
+  rows.push({
+    rule: "Avoid edge (uneven) match compositions",
+    result: edgeMatches.length === 0 ? "pass" : "warn",
+    finding: edgeMatches.length === 0
+      ? "Every match was a clean women's, men's, or mixed doubles composition."
+      : `${edgeMatches.length} match(es) used an edge composition (an uneven gender split) because supply didn't divide cleanly -- expected only as a last resort.`,
   });
 
   const avg = (arr) => (arr.length ? arr.reduce((s, p) => s + p.games_played, 0) / arr.length : 0);
   const womenPlayed = played.filter((p) => p.gender === "female");
   const menPlayed = played.filter((p) => p.gender === "male");
   rows.push({
-    rule: "Pacing between divisions",
+    rule: "Pacing between genders",
     result: !womenPlayed.length || !menPlayed.length ? "n/a" : Math.abs(avg(womenPlayed) - avg(menPlayed)) < 1 ? "pass" : "warn",
-    finding: !womenPlayed.length || !menPlayed.length ? "Need games in both divisions to compare pacing." : `Average games played: ${avg(womenPlayed).toFixed(1)} (women) vs ${avg(menPlayed).toFixed(1)} (men).`,
+    finding: !womenPlayed.length || !menPlayed.length ? "Need games for both genders to compare pacing." : `Average games played: ${avg(womenPlayed).toFixed(1)} (women) vs ${avg(menPlayed).toFixed(1)} (men).`,
   });
 
   return rows;
@@ -157,7 +181,6 @@ function AdminInner({ eventId }) {
   const [draft, setDraft] = useState(null); // {matches, sitting, warnings, roundNumber}
   const [genError, setGenError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [courtSplit, setCourtSplit] = useState(null); // organizer override of the suggested women/men court split; null = use suggestion
   const [origin, setOrigin] = useState("");
   const [copied, setCopied] = useState(false);
 
@@ -189,21 +212,17 @@ function AdminInner({ eventId }) {
   const checkedInCount = players.filter((p) => p.attendance_status === "checked_in").length;
   const completedRoundsCount = roundsWithMatches.filter((r) => r.matches.every((m) => m.status !== "scheduled")).length;
   const capacity = computeCapacity(event, players.length);
-  const auditRows = auditReport(players, roundsWithMatches);
+  const auditRows = auditReport(players, roundsWithMatches, event);
   const participantUrl = `${origin}${BASE_PATH}/live/${eventId}`;
 
-  const { eligibleByGender } = eligiblePlayersByGender(players, new Set(), justPlayedIds);
-  const eligibleFemalePlayers = eligibleByGender.female;
-  const eligibleMalePlayers = eligibleByGender.male;
-  const eligibleFemale = eligibleFemalePlayers.length;
-  const eligibleMale = eligibleMalePlayers.length;
-  const suggestedSplit = suggestCourtSplit(eligibleFemalePlayers, eligibleMalePlayers, event.courts);
+  const { pool: eligiblePool } = eligiblePlayers(players, new Set(), justPlayedIds);
+  const eligibleFemale = eligiblePool.filter((p) => p.gender === "female").length;
+  const eligibleMale = eligiblePool.filter((p) => p.gender === "male").length;
 
   const generate = async () => {
     setGenError(""); setBusy(true);
     const roundNumber = rounds.length + 1;
-    const split = courtSplit || suggestedSplit;
-    const res = generateDraft(players, event.courts, roundNumber, new Set(), justPlayedIds, split);
+    const res = generateDraft(players, event.courts, roundNumber, new Set(), justPlayedIds);
     setBusy(false);
     if (res.error) return setGenError(res.error);
     setDraft(res);
@@ -334,8 +353,7 @@ function AdminInner({ eventId }) {
             draft={draft} setDraft={setDraft} genError={genError} busy={busy}
             generate={generate} publish={publish} byId={byId}
             roundsWithMatches={roundsWithMatches} rounds={rounds}
-            courtSplit={courtSplit} setCourtSplit={setCourtSplit} suggestedSplit={suggestedSplit}
-            eligibleFemale={eligibleFemale} eligibleMale={eligibleMale} numCourts={event.courts}
+            eligibleFemale={eligibleFemale} eligibleMale={eligibleMale}
           />
         )}
 
@@ -483,7 +501,7 @@ function CheckinPanel({ eventId, players, matches, reload }) {
                       <button className="small secondary" disabled={p.attendance_status === "withdrawn"} onClick={() => {
                         const hasPending = matches.some((m) => m.status === "scheduled" && [...m.team_a, ...m.team_b].includes(p.id));
                         if (hasPending && !confirm(`${p.display_name} has a match in progress on their court. Checking out will cancel that match. Continue?`)) return;
-                        checkOutPlayer(eventId, p, matches).then(reload);
+                        checkOutPlayer(eventId, p, matches, players).then(reload);
                       }}>Check out</button>
                     </span>
                   </td>
@@ -531,7 +549,7 @@ function MatchCard({ byId, match, editable, onScore, draft }) {
   const name = (id) => byId[id]?.display_name || "?";
   return (
     <div className="court" style={{ borderLeft: draft ? "4px solid #5d73c7" : "4px solid #c8923e" }}>
-      <div className="label">Court {match.court}{match.division && <span> &middot; {match.division === "female" ? "Women's Doubles" : "Men's Doubles"}</span>}</div>
+      <div className="label">Court {match.court} &middot; {matchTypeLabel(match, byId)}</div>
       <div className="teams">
         <div className="team">{match.team_a.map(name).join(" & ")}</div>
         <div className="vs">VS</div>
@@ -551,25 +569,12 @@ function MatchCard({ byId, match, editable, onScore, draft }) {
   );
 }
 
-function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish, byId, roundsWithMatches, rounds, courtSplit, setCourtSplit, suggestedSplit, eligibleFemale, eligibleMale, numCourts }) {
-  const active = courtSplit || suggestedSplit;
+function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish, byId, roundsWithMatches, rounds, eligibleFemale, eligibleMale }) {
   return (
     <>
       <div className="card">
         <h2>Round generation</h2>
-        {!draft && (
-          <div className="row" style={{ marginBottom: 10 }}>
-            <label className="small">Courts for women ({eligibleFemale} eligible)
-              <input type="number" min={0} max={numCourts} value={active.female} style={{ width: 50, marginLeft: 6 }}
-                onChange={(e) => { const f = Math.max(0, parseInt(e.target.value) || 0); setCourtSplit({ female: f, male: Math.max(0, numCourts - f) }); }} />
-            </label>
-            <label className="small">Courts for men ({eligibleMale} eligible)
-              <input type="number" min={0} max={numCourts} value={active.male} style={{ width: 50, marginLeft: 6 }}
-                onChange={(e) => { const m = Math.max(0, parseInt(e.target.value) || 0); setCourtSplit({ female: Math.max(0, numCourts - m), male: m }); }} />
-            </label>
-            {courtSplit && <button className="small secondary" onClick={() => setCourtSplit(null)}>Reset to suggested</button>}
-          </div>
-        )}
+        {!draft && <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible this round. Courts are assigned automatically across women's, men's, and mixed doubles -- whichever type still has players missing their first experience of it gets priority, then pacing.</p>}
         {draft ? (
           <>
             <p className="note" style={{ fontFamily: "monospace", color: "#4C6E91" }}>DRAFT -- ROUND {draft.roundNumber} -- NOT PUBLISHED</p>
