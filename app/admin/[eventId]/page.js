@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState, useMemo, useRef } from "react";
 import TopBar from "../../../components/TopBar";
-import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore } from "../../../lib/db";
+import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore, cancelMatch } from "../../../lib/db";
 import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
@@ -326,7 +326,7 @@ function AdminInner({ eventId }) {
 
         {tab === "registrants" && <RegistrantsPanel eventId={eventId} players={players} reload={reload} />}
 
-        {tab === "checkin" && <CheckinPanel eventId={eventId} players={players} matches={matches} reload={reload} />}
+        {tab === "checkin" && <CheckinPanel eventId={eventId} players={players} matches={matches} roundsWithMatches={roundsWithMatches} reload={reload} />}
 
         {tab === "match" && (
           <MatchControlPanel
@@ -334,6 +334,7 @@ function AdminInner({ eventId }) {
             generate={generate} publish={publish} byId={byId}
             roundsWithMatches={roundsWithMatches} rounds={rounds}
             eligibleFemale={eligibleFemale} eligibleMale={eligibleMale}
+            eventId={eventId} players={players} reload={reload}
           />
         )}
 
@@ -443,7 +444,7 @@ function RegistrantsPanel({ eventId, players, reload }) {
   );
 }
 
-function CheckinPanel({ eventId, players, matches, reload }) {
+function CheckinPanel({ eventId, players, matches, roundsWithMatches, reload }) {
   const [walkIn, setWalkIn] = useState({ firstName: "", lastName: "", nickname: "", gender: "F", level: "" });
   const checkedInCount = players.filter((p) => p.attendance_status === "checked_in").length;
   const pendingCount = players.filter((p) => p.attendance_status === "not_arrived" || p.attendance_status === "late").length;
@@ -481,7 +482,7 @@ function CheckinPanel({ eventId, players, matches, reload }) {
                       <button className="small secondary" disabled={p.attendance_status === "withdrawn"} onClick={() => {
                         const hasPending = matches.some((m) => m.status === "scheduled" && [...m.team_a, ...m.team_b].includes(p.id));
                         if (hasPending && !confirm(`${p.display_name} has a match in progress on their court. Checking out will cancel that match. Continue?`)) return;
-                        checkOutPlayer(eventId, p, matches, players).then(reload);
+                        checkOutPlayer(eventId, p, matches, players, roundsWithMatches).then(reload);
                       }}>Check out</button>
                     </span>
                   </td>
@@ -523,9 +524,10 @@ function LogPanel({ logs }) {
   );
 }
 
-function MatchCard({ byId, match, editable, onScore, draft }) {
+function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
   const [a, setA] = useState(match.score_a ?? "");
   const [b, setB] = useState(match.score_b ?? "");
+  const [timeExpired, setTimeExpired] = useState(false);
   const name = (id) => byId[id]?.display_name || "?";
   return (
     <div className="court" style={{ borderLeft: draft ? "4px solid #5d73c7" : "4px solid #c8923e" }}>
@@ -536,20 +538,39 @@ function MatchCard({ byId, match, editable, onScore, draft }) {
         <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
       </div>
       {editable && match.status === "scheduled" && (
-        <div className="scorerow">
-          <input type="number" value={a} onChange={(e) => setA(e.target.value)} />
-          <span className="vs">-</span>
-          <input type="number" value={b} onChange={(e) => setB(e.target.value)} />
-          <button className="small" onClick={() => { if (a !== "" && b !== "") onScore(parseInt(a), parseInt(b)); }}>Save score</button>
-        </div>
+        <>
+          <div className="scorerow">
+            <input type="number" min={0} value={a} onChange={(e) => setA(e.target.value)} />
+            <span className="vs">-</span>
+            <input type="number" min={0} value={b} onChange={(e) => setB(e.target.value)} />
+            <button className="small" onClick={() => {
+              const sa = parseInt(a), sb = parseInt(b);
+              if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0 || (sa === 0 && sb === 0)) return;
+              onScore(sa, sb, timeExpired ? "time_expired" : "completed");
+            }}>Save score</button>
+          </div>
+          <label className="small" style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 6 }}>
+            <input type="checkbox" checked={timeExpired} onChange={(e) => setTimeExpired(e.target.checked)} />
+            Time expired mid-game (score stands as entered, not a completed game)
+          </label>
+        </>
+      )}
+      {match.status === "scheduled" && onCancel && (
+        <button className="small secondary" style={{ marginTop: 8, color: "#993d38" }} onClick={onCancel}>Cancel match</button>
       )}
       {match.status === "cancelled" && <p className="note">Cancelled</p>}
-      {match.status !== "scheduled" && match.status !== "cancelled" && <p className="note">Final: {match.score_a}-{match.score_b} ({match.status})</p>}
+      {match.status !== "scheduled" && match.status !== "cancelled" && <p className="note">Final: {match.score_a}-{match.score_b} ({match.status.replace("_", " ")})</p>}
     </div>
   );
 }
 
-function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish, byId, roundsWithMatches, rounds, eligibleFemale, eligibleMale }) {
+function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish, byId, roundsWithMatches, rounds, eligibleFemale, eligibleMale, eventId, players, reload }) {
+  const cancelMatchWithConfirm = (m) => {
+    const names = [...m.team_a, ...m.team_b].map((id) => byId[id]?.display_name).join(", ");
+    const reason = prompt(`Cancel Court ${m.court} (${names})? This can't be undone from the app.\n\nOptional reason (shown in the Event Log):`, "");
+    if (reason === null) return; // cancelled the prompt itself
+    cancelMatch(eventId, m, players, roundsWithMatches, reason).then(reload);
+  };
   return (
     <>
       <div className="card">
@@ -579,28 +600,84 @@ function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish,
       {[...roundsWithMatches].reverse().map((r) => (
         <div key={r.id}>
           <div className="round-title">PUBLISHED -- ROUND {r.number}</div>
-          <div className="courts">{r.matches.map((m) => <MatchCard key={m.id} byId={byId} match={m} editable={false} />)}</div>
+          <div className="courts">{r.matches.map((m) => <MatchCard key={m.id} byId={byId} match={m} editable={false} onCancel={() => cancelMatchWithConfirm(m)} />)}</div>
         </div>
       ))}
     </>
   );
 }
 
+function CorrectableMatchCard({ byId, match, players, reload }) {
+  const [editing, setEditing] = useState(false);
+  const [a, setA] = useState(match.score_a);
+  const [b, setB] = useState(match.score_b);
+  const name = (id) => byId[id]?.display_name || "?";
+  const save = () => {
+    const sa = parseInt(a), sb = parseInt(b);
+    if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0 || (sa === 0 && sb === 0)) return;
+    if (sa === match.score_a && sb === match.score_b) { setEditing(false); return; }
+    correctScore(match, match.score_a, match.score_b, sa, sb, players).then(() => { setEditing(false); reload(); });
+  };
+  return (
+    <div className="court">
+      <div className="label">Court {match.court} &middot; {matchTypeLabel(match, byId)}</div>
+      <div className="teams">
+        <div className="team">{match.team_a.map(name).join(" & ")}</div>
+        <div className="vs">VS</div>
+        <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
+      </div>
+      {!editing ? (
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", flexWrap: "nowrap" }}>
+          <p className="match-score" style={{ margin: 0 }}>{match.score_a}-{match.score_b}{match.status === "time_expired" ? " (time expired)" : ""}</p>
+          <button className="small secondary" onClick={() => { setA(match.score_a); setB(match.score_b); setEditing(true); }}>Edit score</button>
+        </div>
+      ) : (
+        <div className="scorerow">
+          <input type="number" min={0} value={a} onChange={(e) => setA(e.target.value)} />
+          <span className="vs">-</span>
+          <input type="number" min={0} value={b} onChange={(e) => setB(e.target.value)} />
+          <button className="small" onClick={save}>Save correction</button>
+          <button className="small secondary" onClick={() => setEditing(false)}>Cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ScoresPanel({ roundsWithMatches, byId, players, reload }) {
   const pending = roundsWithMatches.flatMap((r) => r.matches.filter((m) => m.status === "scheduled").map((m) => ({ ...m, roundNumber: r.number })));
+  const scoredRounds = [...roundsWithMatches]
+    .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "scheduled" && m.status !== "cancelled") }))
+    .filter((r) => r.matches.length > 0)
+    .reverse();
+
   return (
-    <div className="card">
-      <h2>Pending scores ({pending.length})</h2>
-      {pending.length === 0 && <p className="note">All caught up.</p>}
-      <div className="courts">
-        {pending.map((m) => (
-          <div key={m.id}>
-            <p className="note" style={{ marginBottom: 2 }}>Round {m.roundNumber}</p>
-            <MatchCard byId={byId} match={m} editable onScore={(a, b) => submitScore(m, a, b, players).then(reload)} />
+    <>
+      <div className="card">
+        <h2>Pending scores ({pending.length})</h2>
+        {pending.length === 0 && <p className="note">All caught up.</p>}
+        <div className="courts">
+          {pending.map((m) => (
+            <div key={m.id}>
+              <p className="note" style={{ marginBottom: 2 }}>Round {m.roundNumber}</p>
+              <MatchCard byId={byId} match={m} editable onScore={(a, b, status) => submitScore(m, a, b, players, status).then(reload)} />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="card">
+        <h2>Completed matches ({scoredRounds.reduce((n, r) => n + r.matches.length, 0)})</h2>
+        <p className="note" style={{ marginBottom: 10 }}>Wrong score entered? Click "Edit score" -- stats are reversed and reapplied, and it's logged.</p>
+        {scoredRounds.length === 0 && <p className="note">No scored matches yet.</p>}
+        {scoredRounds.map((r) => (
+          <div key={r.id}>
+            <div className="round-title">ROUND {r.number}</div>
+            <div className="courts">{r.matches.map((m) => <CorrectableMatchCard key={m.id} byId={byId} match={m} players={players} reload={reload} />)}</div>
           </div>
         ))}
       </div>
-    </div>
+    </>
   );
 }
 
