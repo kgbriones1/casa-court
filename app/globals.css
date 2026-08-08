@@ -109,7 +109,7 @@ input,select,textarea{border:1px solid var(--line);border-radius:9px;padding:9px
 /* Participant board is read by non-technical attendees, often on a phone at
    a glance -- everything here reads noticeably bigger than the dense,
    organizer-only admin console using these same shared classes. */
-.participant .tabs button{font-size:15px;padding:13px 0}
+.participant .tabs button{font-size:13px;padding:13px 0}
 .participant .round-title{font-size:15px;margin:22px 0 10px}
 .participant .card h2{font-size:17px}
 .participant .card{padding:20px}
