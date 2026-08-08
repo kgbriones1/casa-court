@@ -1,15 +1,15 @@
 "use client";
 import { useEffect, useState, useMemo, useRef } from "react";
 import TopBar from "../../../components/TopBar";
-import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore } from "../../../lib/db";
+import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore } from "../../../lib/db";
 import { generateDraft, swapPlayers, suggestCourtSplit } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
 const ATT_COLOR = { not_arrived: "#8a8067", late: "#b58a2f", checked_in: "#2c6e3f", temporarily_unavailable: "#4C6E91", no_show: "#a83232", withdrawn: "#5b5142" };
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "";
 
-function Pill({ children, color }) {
-  return <span style={{ fontSize: 10, fontFamily: "monospace", background: color, color: "#F4EDE0", padding: "2px 6px", borderRadius: 10, textTransform: "uppercase" }}>{children}</span>;
+function Pill({ children, color, style }) {
+  return <span style={{ fontSize: 10, fontFamily: "monospace", background: color, color: "#F4EDE0", padding: "2px 6px", borderRadius: 10, textTransform: "uppercase", ...style }}>{children}</span>;
 }
 
 function leaderboardFor(players, gender) {
@@ -253,33 +253,50 @@ function RegistrantsPanel({ eventId, players, reload }) {
 
 function CheckinPanel({ eventId, players, matches, reload }) {
   const [walkIn, setWalkIn] = useState({ firstName: "", lastName: "", nickname: "", gender: "F", level: "" });
+  const checkedInCount = players.filter((p) => p.attendance_status === "checked_in").length;
+  const pendingCount = players.filter((p) => p.attendance_status === "not_arrived" || p.attendance_status === "late").length;
 
   return (
     <>
       <div className="card">
-        <h2>Check-in ({players.filter((p) => p.attendance_status === "checked_in").length}/{players.length})</h2>
-        <div style={{ display: "grid", gap: 6 }}>
-          {players.map((p) => (
-            <div key={p.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: "#f3f0eb", borderRadius: 10, padding: "8px 10px", fontSize: 12, gap: 6, flexWrap: "wrap" }}>
-              <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                {p.display_name} <Pill color={p.gender === "female" ? "#cf5449" : "#5d73c7"}>{p.gender === "female" ? "F" : "M"}</Pill>
-                {p.level != null && <Pill color="#77777d">Lvl {p.level}</Pill>}
-                {p.registration_status === "walk_in" && <Pill color="#c8923e">Walk-in</Pill>}
-                <Pill color={ATT_COLOR[p.attendance_status]}>{ATT_LABEL[p.attendance_status]}{p.attendance_status === "late" && p.eta_note ? `: ${p.eta_note}` : ""}</Pill>
-              </span>
-              <span style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                <button className="small" onClick={() => setAttendance(eventId, p.id, p.display_name, "checked_in").then(reload)}>In</button>
-                <button className="small secondary" onClick={() => { const note = prompt("ETA for " + p.display_name, p.eta_note) || ""; setAttendance(eventId, p.id, p.display_name, "late", note).then(reload); }}>Late</button>
-                <button className="small secondary" onClick={() => setAttendance(eventId, p.id, p.display_name, "temporarily_unavailable").then(reload)}>Temp.</button>
-                <button className="small secondary" onClick={() => setAttendance(eventId, p.id, p.display_name, "no_show").then(reload)}>No-show</button>
-                <button className="small secondary" onClick={() => {
-                  const hasPending = matches.some((m) => m.status === "scheduled" && [...m.team_a, ...m.team_b].includes(p.id));
-                  if (hasPending && !confirm(`${p.display_name} has a match in progress on their court. Checking out will cancel that match. Continue?`)) return;
-                  checkOutPlayer(eventId, p, matches).then(reload);
-                }}>Check out</button>
-              </span>
-            </div>
-          ))}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <h2 style={{ flex: 1 }}>Check-in ({checkedInCount}/{players.length})</h2>
+          <button className="small" disabled={!pendingCount} onClick={() => checkInAll(eventId, players).then(reload)}>Check in all</button>
+        </div>
+        <div className="tablewrap">
+          <table>
+            <thead><tr><th>ID</th><th>Name</th><th>Gender</th><th>Status</th><th>Games</th><th>Actions</th></tr></thead>
+            <tbody>
+              {players.map((p, i) => (
+                <tr key={p.id}>
+                  <td className="small">KQ-{String(i + 1).padStart(3, "0")}</td>
+                  <td>
+                    <strong>{p.display_name}</strong>
+                    {p.registration_status === "walk_in" && <Pill color="#c8923e" style={{ marginLeft: 6 }}>Walk-in</Pill>}
+                  </td>
+                  <td>{p.gender === "female" ? "F" : "M"}</td>
+                  <td style={{ color: ATT_COLOR[p.attendance_status], fontWeight: 800 }}>
+                    {ATT_LABEL[p.attendance_status]}{p.attendance_status === "late" && p.eta_note ? `: ${p.eta_note}` : ""}
+                  </td>
+                  <td>{p.games_played}</td>
+                  <td>
+                    <span style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                      <button className="small" disabled={p.attendance_status === "checked_in"} onClick={() => setAttendance(eventId, p.id, p.display_name, "checked_in").then(reload)}>Check in</button>
+                      <button className="small secondary" disabled={p.attendance_status === "late"} onClick={() => { const note = prompt("ETA for " + p.display_name, p.eta_note) || ""; setAttendance(eventId, p.id, p.display_name, "late", note).then(reload); }}>Late</button>
+                      <button className="small secondary" disabled={p.attendance_status === "temporarily_unavailable"} onClick={() => setAttendance(eventId, p.id, p.display_name, "temporarily_unavailable").then(reload)}>Unavailable</button>
+                      <button className="small secondary" disabled={p.attendance_status === "no_show"} onClick={() => setAttendance(eventId, p.id, p.display_name, "no_show").then(reload)}>No-show</button>
+                      <button className="small secondary" disabled={p.attendance_status === "not_arrived"} onClick={() => setAttendance(eventId, p.id, p.display_name, "not_arrived").then(reload)}>Reset</button>
+                      <button className="small secondary" disabled={p.attendance_status === "withdrawn"} onClick={() => {
+                        const hasPending = matches.some((m) => m.status === "scheduled" && [...m.team_a, ...m.team_b].includes(p.id));
+                        if (hasPending && !confirm(`${p.display_name} has a match in progress on their court. Checking out will cancel that match. Continue?`)) return;
+                        checkOutPlayer(eventId, p, matches).then(reload);
+                      }}>Check out</button>
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 56px 56px auto", gap: 6, alignItems: "center", marginTop: 12 }}>
           <input placeholder="First" value={walkIn.firstName} onChange={(e) => setWalkIn({ ...walkIn, firstName: e.target.value })} />
