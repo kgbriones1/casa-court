@@ -1,0 +1,16 @@
+name = "casa-events-proxy"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# After `wrangler deploy`, attach this Worker to a Route in the Cloudflare
+# dashboard (Websites > everydaycasa.ph > Workers Routes):
+#   Route: everydaycasa.ph/casa-events*
+#   Worker: casa-events-proxy
+#
+# Routes can't be set from wrangler.toml alone for an existing zone without
+# the zone_id -- easiest to add it from the dashboard directly, or uncomment
+# and fill this in if you'd rather manage it as code:
+#
+# [[routes]]
+# pattern = "everydaycasa.ph/casa-events*"
+# zone_name = "everydaycasa.ph"
