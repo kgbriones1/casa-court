@@ -46,6 +46,15 @@ function LiveInner({ eventId }) {
     return subscribeEvent(eventId, reload);
   }, [eventId]);
 
+  // Must run before the early returns below -- calling useMemo after a conditional
+  // return means it's skipped on the first (loading) render and called on the next
+  // one, which violates the Rules of Hooks and crashes React with a hook-count
+  // mismatch once real data arrives (minified error #310).
+  const matched = useMemo(() => {
+    if (!search.trim() || !state?.players) return null;
+    return state.players.find((p) => p.display_name.toLowerCase().includes(search.trim().toLowerCase()));
+  }, [search, state]);
+
   if (!eventId) return <div className="wrap"><div className="card">No event link -- ask the organizer for the QR code or link.</div></div>;
   if (!state?.event) return <div className="wrap"><div className="card">Loading...</div></div>;
 
@@ -56,11 +65,6 @@ function LiveInner({ eventId }) {
   const ongoingSitting = ongoing
     ? players.filter((p) => p.attendance_status === "checked_in" && !ongoing.matches.some((m) => [...m.team_a, ...m.team_b].includes(p.id))).map((p) => p.display_name)
     : [];
-
-  const matched = useMemo(() => {
-    if (!search.trim()) return null;
-    return players.find((p) => p.display_name.toLowerCase().includes(search.trim().toLowerCase()));
-  }, [search, players]);
 
   return (
     <div>
