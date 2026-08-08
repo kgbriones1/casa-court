@@ -71,6 +71,11 @@ input,select,textarea{border:1px solid var(--line);border-radius:9px;padding:9px
 .tabs button.active{background:var(--gradient);border-color:var(--coral);color:#fff}
 
 .round-title{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin:18px 0 8px;font-weight:800}
+.section-title{font-size:18px;font-weight:800;color:var(--ink);margin:22px 0 10px}
+.round-card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:12px}
+.round-card-title{font-size:17px;font-weight:800}
+.round-card-time{font-size:13px;color:var(--muted);margin-top:2px}
+.match-score{font-size:17px;font-weight:800;color:var(--ink);margin:8px 0 0}
 .courts{display:grid;gap:10px}
 @media(min-width:700px){.courts{grid-template-columns:repeat(3,1fr)}}
 .court{border:1px solid var(--line);border-radius:12px;padding:12px;background:#faf9f7}

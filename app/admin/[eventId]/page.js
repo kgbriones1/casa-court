@@ -95,11 +95,27 @@ function auditReport(players, roundsWithMatches) {
 
   const played = players.filter((p) => p.games_played > 0);
   const counts = played.map((p) => p.games_played);
-  const spread = counts.length ? Math.max(...counts) - Math.min(...counts) : 0;
+  // "Typical" = the most common games_played count, not min/max -- with attendance
+  // changes (late arrivals, early checkouts) in the mix, mode is a much more honest
+  // baseline than the raw spread for "what a fully-present player should have."
+  const typical = counts.length
+    ? [...counts.reduce((m, v) => m.set(v, (m.get(v) || 0) + 1), new Map()).entries()].sort((a, b) => b[1] - a[1])[0][0]
+    : null;
+  const outliers = typical == null ? [] : played.filter((p) => Math.abs(p.games_played - typical) > 1);
+  // Currently checked_in players have no attendance-based excuse to be off-pace --
+  // that's a real balance problem worth failing on. Anyone else (late, withdrawn,
+  // temporarily_unavailable, no_show) plausibly missed rounds for a legitimate
+  // reason, so it's downgraded to a warning naming them, not a failure.
+  const unexplained = outliers.filter((p) => p.attendance_status === "checked_in");
+  const explained = outliers.filter((p) => p.attendance_status !== "checked_in");
+  const describe = (p) => `${p.display_name} (${p.games_played}, ${ATT_LABEL[p.attendance_status]})`;
+  const findingParts = [];
+  if (unexplained.length) findingParts.push(`${unexplained.length} currently checked-in player(s) more than 1 game off the typical ${typical} with no attendance explanation: ${unexplained.map(describe).join(", ")}`);
+  if (explained.length) findingParts.push(`${explained.length} more off-pace but explained by attendance status: ${explained.map(describe).join(", ")}`);
   rows.push({
     rule: "Balance games played",
-    result: !counts.length ? "n/a" : spread <= 1 ? "pass" : spread <= 2 ? "warn" : "fail",
-    finding: counts.length ? `Spread of ${spread} game(s) across ${played.length} players who've played (min ${Math.min(...counts)}, max ${Math.max(...counts)}).` : "No scored games yet.",
+    result: !counts.length ? "n/a" : unexplained.length ? "fail" : explained.length ? "warn" : "pass",
+    finding: !counts.length ? "No scored games yet." : findingParts.length ? findingParts.join(" -- ") : `All ${played.length} players who've played are within 1 game of the typical ${typical}.`,
   });
 
   ["female", "male"].forEach((g) => {

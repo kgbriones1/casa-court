@@ -16,6 +16,24 @@ function classify(roundsWithMatches) {
   return { results, ongoing, upcoming };
 }
 
+/** Estimated clock time for a round, from the event's start time and round length --
+ * a planned slot (like the Match Control tab's), not a live elapsed-time stamp, since
+ * real events run ahead of or behind schedule. Returns null if the event has no
+ * start time or round length set. */
+function roundTimeRange(event, roundNumber) {
+  if (!event.start_time || !event.round_minutes) return null;
+  const [sh, sm] = event.start_time.split(":").map(Number);
+  const startMins = sh * 60 + sm + (roundNumber - 1) * event.round_minutes;
+  const endMins = startMins + event.round_minutes;
+  const fmt = (mins) => {
+    const h24 = Math.floor(mins / 60) % 24;
+    const m = mins % 60;
+    const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
+    return `${h12}:${String(m).padStart(2, "0")} ${h24 >= 12 ? "PM" : "AM"}`;
+  };
+  return `${fmt(startMins)} – ${fmt(endMins)}`;
+}
+
 function MatchRow({ byId, m, highlightId }) {
   const name = (id) => byId[id]?.display_name || "?";
   const involves = highlightId && [...m.team_a, ...m.team_b].includes(highlightId);
@@ -28,7 +46,23 @@ function MatchRow({ byId, m, highlightId }) {
         <div className="team" style={{ textAlign: "right" }}>{m.team_b.map(name).join(" & ")}</div>
       </div>
       {m.status === "cancelled" && <p className="note">Cancelled</p>}
-      {m.status !== "scheduled" && m.status !== "cancelled" && <p className="note">Final: {m.score_a}-{m.score_b}</p>}
+      {m.status !== "scheduled" && m.status !== "cancelled" && <p className="match-score">{m.score_a}–{m.score_b}</p>}
+    </div>
+  );
+}
+
+function RoundCard({ round, event, byId, highlightId, badge }) {
+  const timeRange = roundTimeRange(event, round.number);
+  return (
+    <div className="card round-card">
+      <div className="round-card-head">
+        <div>
+          <div className="round-card-title">Round {round.number}</div>
+          {timeRange && <div className="round-card-time">{timeRange}</div>}
+        </div>
+        <span className={`badge ${badge.color}`}>{badge.label}</span>
+      </div>
+      <div className="courts">{round.matches.map((m) => <MatchRow key={m.id} byId={byId} m={m} highlightId={highlightId} />)}</div>
     </div>
   );
 }
@@ -85,23 +119,23 @@ function LiveInner({ eventId }) {
             </div>
             {ongoing && (
               <>
-                <div className="round-title">PLAYING NOW -- ROUND {ongoing.number}</div>
-                <div className="courts">{ongoing.matches.map((m) => <MatchRow key={m.id} byId={byId} m={m} highlightId={matched?.id} />)}</div>
+                <div className="section-title">Playing now</div>
+                <RoundCard round={ongoing} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Live", color: "red" }} />
                 {ongoingSitting.length > 0 && <div className="sitout">Resting: {ongoingSitting.join(", ")}</div>}
               </>
             )}
-            {upcoming.map((r) => (
-              <div key={r.id}>
-                <div className="round-title">UP NEXT -- ROUND {r.number}</div>
-                <div className="courts">{r.matches.map((m) => <MatchRow key={m.id} byId={byId} m={m} highlightId={matched?.id} />)}</div>
-              </div>
-            ))}
-            {[...results].reverse().map((r) => (
-              <div key={r.id}>
-                <div className="round-title">RESULTS -- ROUND {r.number}</div>
-                <div className="courts">{r.matches.map((m) => <MatchRow key={m.id} byId={byId} m={m} highlightId={matched?.id} />)}</div>
-              </div>
-            ))}
+            {upcoming.length > 0 && (
+              <>
+                <div className="section-title">Up next</div>
+                {upcoming.map((r) => <RoundCard key={r.id} round={r} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Upcoming", color: "gray" }} />)}
+              </>
+            )}
+            {results.length > 0 && (
+              <>
+                <div className="section-title">Results</div>
+                {[...results].reverse().map((r) => <RoundCard key={r.id} round={r} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Completed", color: "blue" }} />)}
+              </>
+            )}
           </>
         )}
 
