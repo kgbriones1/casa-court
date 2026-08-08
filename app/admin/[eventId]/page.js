@@ -564,6 +564,62 @@ function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
   );
 }
 
+/** The oldest published round that still has an unscored match ("ongoing"), plus
+ * every published round after it ("upcoming") -- same definition the participant
+ * board uses for Playing now / Up next, reused here so Match Control's idea of
+ * "current" and "next" per court matches what participants actually see. */
+function classifyRounds(roundsWithMatches) {
+  const sorted = [...roundsWithMatches].sort((a, b) => a.number - b.number);
+  const notDone = sorted.filter((r) => r.matches.some((m) => m.status === "scheduled"));
+  return { ongoing: notDone[0] || null, upcoming: notDone.slice(1) };
+}
+
+function CourtStatusBoard({ roundsWithMatches, byId }) {
+  const numCourts = Math.max(0, ...roundsWithMatches.flatMap((r) => r.matches.map((m) => m.court)));
+  if (numCourts === 0) return null;
+  const { ongoing, upcoming } = classifyRounds(roundsWithMatches);
+  const name = (id) => byId[id]?.display_name || "?";
+
+  return (
+    <div className="card">
+      <h2>Court status</h2>
+      <p className="note" style={{ marginBottom: 10 }}>What's on each court right now, and what's already queued up next -- so a court doesn't have to sit idle waiting for the others to finish. Generate and publish the next round early to get it queued here.</p>
+      <div className="courts">
+        {Array.from({ length: numCourts }, (_, i) => i + 1).map((courtNum) => {
+          const current = ongoing?.matches.find((m) => m.court === courtNum);
+          const nextRound = upcoming.find((r) => r.matches.some((m) => m.court === courtNum));
+          const next = nextRound?.matches.find((m) => m.court === courtNum);
+          return (
+            <div key={courtNum} className="court">
+              <div className="label">Court {courtNum}</div>
+              {current ? (
+                <>
+                  <p className="small" style={{ margin: "4px 0" }}>Now &middot; Round {ongoing.number} &middot; {matchTypeLabel(current, byId)}</p>
+                  <div className="teams" style={{ fontSize: 14 }}>
+                    <div className="team">{current.team_a.map(name).join(" & ")}</div>
+                    <div className="vs">VS</div>
+                    <div className="team" style={{ textAlign: "right" }}>{current.team_b.map(name).join(" & ")}</div>
+                  </div>
+                </>
+              ) : <p className="note">Nothing in progress on this court.</p>}
+              {next ? (
+                <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--line)" }}>
+                  <p className="small" style={{ margin: "0 0 4px", color: "var(--gold)", fontWeight: 700 }}>Next &middot; Round {nextRound.number}</p>
+                  <div className="teams" style={{ fontSize: 13 }}>
+                    <div className="team">{next.team_a.map(name).join(" & ")}</div>
+                    <div className="vs">VS</div>
+                    <div className="team" style={{ textAlign: "right" }}>{next.team_b.map(name).join(" & ")}</div>
+                  </div>
+                </div>
+              ) : <p className="note" style={{ marginTop: 8 }}>Nothing queued yet for this court.</p>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish, byId, roundsWithMatches, rounds, eligibleFemale, eligibleMale, eventId, players, reload }) {
   const cancelMatchWithConfirm = (m) => {
     const names = [...m.team_a, ...m.team_b].map((id) => byId[id]?.display_name).join(", ");
@@ -571,10 +627,20 @@ function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish,
     if (reason === null) return; // cancelled the prompt itself
     cancelMatch(eventId, m, players, roundsWithMatches, reason).then(reload);
   };
+  const { ongoing, upcoming } = classifyRounds(roundsWithMatches);
+  const ongoingPendingCount = ongoing ? ongoing.matches.filter((m) => m.status === "scheduled").length : 0;
+  const showGenerateAheadNudge = ongoingPendingCount > 0 && upcoming.length === 0;
   return (
     <>
+      <CourtStatusBoard roundsWithMatches={roundsWithMatches} byId={byId} />
+
       <div className="card">
         <h2>Round generation</h2>
+        {!draft && showGenerateAheadNudge && (
+          <div className="warn-box">
+            Round {ongoing.number} still has {ongoingPendingCount} match{ongoingPendingCount === 1 ? "" : "es"} in progress -- you can generate and publish the next round now so courts don't sit idle when they finish. It'll show up in Court status above as each court's "Next."
+          </div>
+        )}
         {!draft && <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible this round ({eligibleFemale + eligibleMale} total). Matchmaking is gender-blind -- anyone can be partnered with or matched against anyone, based on balance, rest, and never repeating a partner.</p>}
         {draft ? (
           <>
@@ -651,18 +717,39 @@ function ScoresPanel({ roundsWithMatches, byId, players, reload }) {
     .filter((r) => r.matches.length > 0)
     .reverse();
 
+  // What's already queued for this same court in a later published round, if any --
+  // so scoring this match and freeing the court doesn't mean checking Match Control
+  // separately to know who's up next on it.
+  const nextOnCourt = (m) => {
+    const later = roundsWithMatches.filter((r) => r.number > m.roundNumber).sort((a, b) => a.number - b.number);
+    for (const r of later) {
+      const nm = r.matches.find((mm) => mm.court === m.court);
+      if (nm) return { match: nm, roundNumber: r.number };
+    }
+    return null;
+  };
+  const name = (id) => byId[id]?.display_name || "?";
+
   return (
     <>
       <div className="card">
         <h2>Pending scores ({pending.length})</h2>
         {pending.length === 0 && <p className="note">All caught up.</p>}
         <div className="courts">
-          {pending.map((m) => (
-            <div key={m.id}>
-              <p className="note" style={{ marginBottom: 2 }}>Round {m.roundNumber}</p>
-              <MatchCard byId={byId} match={m} editable onScore={(a, b, status) => submitScore(m, a, b, players, status).then(reload)} />
-            </div>
-          ))}
+          {pending.map((m) => {
+            const next = nextOnCourt(m);
+            return (
+              <div key={m.id}>
+                <p className="note" style={{ marginBottom: 2 }}>Round {m.roundNumber}</p>
+                <MatchCard byId={byId} match={m} editable onScore={(a, b, status) => submitScore(m, a, b, players, status).then(reload)} />
+                {next && (
+                  <p className="note" style={{ marginTop: 4 }}>
+                    Once scored, Court {m.court} is next up for Round {next.roundNumber}: {next.match.team_a.map(name).join(" & ")} vs {next.match.team_b.map(name).join(" & ")}
+                  </p>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
