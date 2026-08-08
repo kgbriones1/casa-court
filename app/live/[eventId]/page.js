@@ -132,12 +132,8 @@ function LiveInner({ eventId }) {
           <div className="card">
             <h2>How ranking works</h2>
             <p>Your point differential from every match is added together. Win 11-7: +4. Lose 8-11: -4. It all adds up across the event.</p>
-            <h2>Partners &amp; opponents</h2>
-            <p>The system avoids repeat partners and minimizes repeat opponents. Match counts and rest are balanced where possible.</p>
             <h2>Awards</h2>
             <p>Highest male differential wins King of the Court. Highest female differential wins Queen of the Court. A first-place tie is settled by a singles tiebreaker.</p>
-            <h2>Time limit</h2>
-            <p>Matches may end when the round timer expires. The score at the buzzer becomes final.</p>
           </div>
         )}
       </div>
