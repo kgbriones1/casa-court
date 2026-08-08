@@ -574,10 +574,23 @@ function classifyRounds(roundsWithMatches) {
   return { ongoing: notDone[0] || null, upcoming: notDone.slice(1) };
 }
 
+/** Per-court status must be checked per court, not borrowed from whether the round
+ * as a whole is done -- a round can have one court already scored while its other
+ * courts are still in progress, and that finished court is genuinely free even
+ * though its round isn't "done" yet. Walks this court's matches across every
+ * published round in order and takes the still-scheduled ones: the earliest is
+ * "current," the one after that (if a later round is already published for this
+ * court) is "next." */
+function courtStatus(roundsWithMatches, courtNum) {
+  const sorted = [...roundsWithMatches].sort((a, b) => a.number - b.number);
+  const scheduled = sorted
+    .flatMap((r) => r.matches.filter((m) => m.court === courtNum && m.status === "scheduled").map((m) => ({ ...m, roundNumber: r.number })));
+  return { current: scheduled[0] || null, next: scheduled[1] || null };
+}
+
 function CourtStatusBoard({ roundsWithMatches, byId }) {
   const numCourts = Math.max(0, ...roundsWithMatches.flatMap((r) => r.matches.map((m) => m.court)));
   if (numCourts === 0) return null;
-  const { ongoing, upcoming } = classifyRounds(roundsWithMatches);
   const name = (id) => byId[id]?.display_name || "?";
 
   return (
@@ -586,25 +599,23 @@ function CourtStatusBoard({ roundsWithMatches, byId }) {
       <p className="note" style={{ marginBottom: 10 }}>What's on each court right now, and what's already queued up next -- so a court doesn't have to sit idle waiting for the others to finish. Generate and publish the next round early to get it queued here.</p>
       <div className="courts">
         {Array.from({ length: numCourts }, (_, i) => i + 1).map((courtNum) => {
-          const current = ongoing?.matches.find((m) => m.court === courtNum);
-          const nextRound = upcoming.find((r) => r.matches.some((m) => m.court === courtNum));
-          const next = nextRound?.matches.find((m) => m.court === courtNum);
+          const { current, next } = courtStatus(roundsWithMatches, courtNum);
           return (
             <div key={courtNum} className="court">
               <div className="label">Court {courtNum}</div>
               {current ? (
                 <>
-                  <p className="small" style={{ margin: "4px 0" }}>Now &middot; Round {ongoing.number} &middot; {matchTypeLabel(current, byId)}</p>
+                  <p className="small" style={{ margin: "4px 0" }}>Now &middot; Round {current.roundNumber} &middot; {matchTypeLabel(current, byId)}</p>
                   <div className="teams" style={{ fontSize: 14 }}>
                     <div className="team">{current.team_a.map(name).join(" & ")}</div>
                     <div className="vs">VS</div>
                     <div className="team" style={{ textAlign: "right" }}>{current.team_b.map(name).join(" & ")}</div>
                   </div>
                 </>
-              ) : <p className="note">Nothing in progress on this court.</p>}
+              ) : <p className="note">Free -- nothing scheduled on this court right now.</p>}
               {next ? (
                 <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--line)" }}>
-                  <p className="small" style={{ margin: "0 0 4px", color: "var(--gold)", fontWeight: 700 }}>Next &middot; Round {nextRound.number}</p>
+                  <p className="small" style={{ margin: "0 0 4px", color: "var(--gold)", fontWeight: 700 }}>Next &middot; Round {next.roundNumber}</p>
                   <div className="teams" style={{ fontSize: 13 }}>
                     <div className="team">{next.team_a.map(name).join(" & ")}</div>
                     <div className="vs">VS</div>
