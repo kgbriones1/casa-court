@@ -155,7 +155,15 @@ function AdminInner({ eventId }) {
   useEffect(() => { setOrigin(window.location.origin); }, []);
 
   if (!eventId) return <div className="wrap"><div className="card">Missing event -- open this page from the Event Manager.</div></div>;
-  if (!state?.event) return <div className="wrap"><div className="card">Loading...</div></div>;
+  if (state === null) return <div className="wrap"><div className="card">Loading...</div></div>;
+  if (!state.event) return (
+    <div className="wrap">
+      <div className="card">
+        <p>Event not found -- it may have been deleted.</p>
+        <button onClick={() => { window.location.href = BASE_PATH + "/admin"; }}>Back to Event Manager</button>
+      </div>
+    </div>
+  );
 
   const { event, players, rounds, matches } = state;
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));

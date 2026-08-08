@@ -56,7 +56,8 @@ function LiveInner({ eventId }) {
   }, [search, state]);
 
   if (!eventId) return <div className="wrap"><div className="card">No event link -- ask the organizer for the QR code or link.</div></div>;
-  if (!state?.event) return <div className="wrap"><div className="card">Loading...</div></div>;
+  if (state === null) return <div className="wrap"><div className="card">Loading...</div></div>;
+  if (!state.event) return <div className="wrap"><div className="card">Event not found -- this link may be outdated. Ask the organizer for the current QR code or link.</div></div>;
 
   const { event, players, rounds, matches } = state;
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));
