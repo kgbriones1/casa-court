@@ -69,7 +69,7 @@ function LiveInner({ eventId }) {
 
   return (
     <div>
-      <TopBar title={event.name} subtitle={event.ended ? "Event ended" : `Round ${rounds.length} \u00B7 Live board`} />
+      <TopBar title={event.name} subtitle={event.ended ? "Event ended" : `Round ${rounds.length} \u00B7 Live board`} large />
       <div className="wrap participant">
         <div className="tabs" style={{ marginTop: 14 }}>
           <button className={tab === "matches" ? "active" : ""} onClick={() => setTab("matches")}>Matches</button>

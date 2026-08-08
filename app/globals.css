@@ -89,11 +89,28 @@ input,select,textarea{border:1px solid var(--line);border-radius:9px;padding:9px
 .event-meta{display:grid;gap:6px;margin:12px 0;font-size:13px}
 .empty{padding:48px 20px;text-align:center}
 
-.participant{max-width:1000px;margin:0 auto}
+.participant{max-width:1000px;margin:0 auto;font-size:15px}
 .rankrow{display:grid;grid-template-columns:34px 1fr 64px;padding:10px 0;border-top:1px solid var(--line);align-items:center}
 .rankrow:first-child{border-top:0}
 .matchrow{padding:11px 0;border-top:1px solid var(--line)}
 .matchrow:first-child{border-top:0}
+
+/* Participant board is read by non-technical attendees, often on a phone at
+   a glance -- everything here reads noticeably bigger than the dense,
+   organizer-only admin console using these same shared classes. */
+.participant .tabs button{font-size:15px;padding:13px 0}
+.participant .round-title{font-size:15px;margin:22px 0 10px}
+.participant .card h2{font-size:17px}
+.participant .card{padding:20px}
+.participant .court{padding:16px}
+.participant .court .label{font-size:14px}
+.participant .teams{font-size:19px}
+.participant .vs{font-size:13px}
+.participant .note{font-size:14px}
+.participant table th,.participant table td{font-size:15px;padding:13px 12px}
+.participant input{font-size:15px;padding:12px 14px}
+.participant .sitout{font-size:14px}
+.participant .rankrow{font-size:16px}
 
 @media(max-width:900px){
   .metrics{grid-template-columns:repeat(2,1fr)}
