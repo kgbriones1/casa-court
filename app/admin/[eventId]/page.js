@@ -262,7 +262,7 @@ function AdminInner({ eventId }) {
               <div className="card"><div className="small">Event duration</div><div className="metric">{capacity ? `${capacity.mins} min` : "--"}</div></div>
               <div className="card"><div className="small">Courts occupied</div><div className="metric">{event.courts}</div></div>
               <div className="card"><div className="small">{capacity ? `${capacity.roundMinutes}-minute rounds` : "Planned rounds"}</div><div className="metric">{capacity ? capacity.plannedRounds : "--"}</div></div>
-              <div className="card"><div className="small">Estimated games / player</div><div className="metric">{capacity?.estGamesPerPlayer != null ? capacity.estGamesPerPlayer.toFixed(1) : "--"}</div></div>
+              <div className="card"><div className="small">Est. games / player (full event)</div><div className="metric">{capacity?.estGamesPerPlayer != null ? capacity.estGamesPerPlayer.toFixed(1) : "--"}</div></div>
             </div>
 
             <div className="card">
