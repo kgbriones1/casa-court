@@ -22,6 +22,7 @@ aside{background:#fff;border-right:1px solid var(--line);padding:18px}
 .event-card{background:#f3f0eb;border-radius:14px;padding:13px;margin-bottom:16px}
 .nav button{display:block;width:100%;text-align:left;border:0;background:transparent;padding:11px 12px;border-radius:10px;margin:3px 0;cursor:pointer;color:#55565c;font-size:13px;font-weight:600}
 .nav button.active{background:var(--gradient);color:#fff;font-weight:800}
+.nav button:not(.active){background:transparent!important;color:#55565c!important;border-color:transparent!important}
 
 main,.main{padding:24px}
 .wrap{max-width:1180px;margin:0 auto;padding:24px}

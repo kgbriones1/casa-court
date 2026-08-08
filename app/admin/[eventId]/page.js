@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import TopBar from "../../../components/TopBar";
 import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore } from "../../../lib/db";
 import { generateDraft, swapPlayers, suggestCourtSplit } from "../../../lib/scheduler";
@@ -156,23 +156,54 @@ function AdminInner({ eventId }) {
   );
 }
 
+function downloadCsvTemplate() {
+  const csv = "First,Surname,Nickname,Gender,Level\nAna,Santos,,F,3.5\nMiguel,Torres,,M,4.0\n";
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = "casa-court-registrant-template.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function parseCsvText(text) {
+  const lines = text.split("\n").map((s) => s.trim()).filter(Boolean);
+  // Skip a header row if it looks like one (starts with "first" case-insensitive)
+  const dataLines = lines[0]?.toLowerCase().startsWith("first") ? lines.slice(1) : lines;
+  return dataLines.map((line) => {
+    const [firstName = "", lastName = "", nickname = "", gender = "F", level = ""] = line.split(",").map((s) => s.trim());
+    return { firstName, lastName, nickname, gender: gender.toUpperCase().startsWith("M") ? "M" : "F", level };
+  });
+}
+
 function RegistrantsPanel({ eventId, players, reload }) {
   const [rows, setRows] = useState([{ firstName: "", lastName: "", nickname: "", gender: "F", level: "" }]);
   const [bulk, setBulk] = useState("");
+  const fileInputRef = useRef(null);
+
+  const handleFile = (file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const parsed = parseCsvText(e.target.result);
+      setRows([...rows.filter((r) => r.firstName), ...parsed]);
+    };
+    reader.readAsText(file);
+  };
 
   return (
     <>
       <div className="card">
         <h2>Import roster</h2>
-        <p className="note">Paste CSV rows (First,Surname,Nickname,Gender,Level) or upload the registrant CSV export -- either way, review below before saving.</p>
-        <textarea value={bulk} onChange={(e) => setBulk(e.target.value)} placeholder="First,Surname,Nickname,Gender,Level" style={{ minHeight: 90, width: "100%" }} />
+        <p className="note">Paste CSV rows, or upload a CSV file directly -- either way, review below before saving.</p>
+        <div className="row">
+          <button className="small secondary" onClick={downloadCsvTemplate}>Download CSV template</button>
+          <button className="small secondary" onClick={() => fileInputRef.current?.click()}>Upload CSV</button>
+          <input ref={fileInputRef} type="file" accept=".csv,text/csv" hidden onChange={(e) => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ""; }} />
+        </div>
+        <textarea value={bulk} onChange={(e) => setBulk(e.target.value)} placeholder="Or paste rows here: First,Surname,Nickname,Gender,Level" style={{ minHeight: 90, width: "100%", marginTop: 10 }} />
         <div className="row">
           <button className="small secondary" onClick={() => {
-            const parsed = bulk.split("\n").map((s) => s.trim()).filter(Boolean).map((line) => {
-              const [firstName = "", lastName = "", nickname = "", gender = "F", level = ""] = line.split(",").map((s) => s.trim());
-              return { firstName, lastName, nickname, gender: gender.toUpperCase().startsWith("M") ? "M" : "F", level };
-            });
-            setRows([...rows.filter((r) => r.firstName), ...parsed]);
+            setRows([...rows.filter((r) => r.firstName), ...parseCsvText(bulk)]);
             setBulk("");
           }}>Parse into rows below</button>
         </div>
@@ -198,13 +229,15 @@ function RegistrantsPanel({ eventId, players, reload }) {
         <h2>Registrants ({players.length})</h2>
         <div className="tablewrap">
           <table>
-            <thead><tr><th>Name</th><th>Gender</th><th>Level</th><th>Type</th><th>Status</th></tr></thead>
+            <thead><tr><th>ID</th><th>Name</th><th>Gender</th><th>Level</th><th>Games</th><th>Type</th><th>Status</th></tr></thead>
             <tbody>
-              {players.map((p) => (
+              {players.map((p, i) => (
                 <tr key={p.id}>
+                  <td className="small">KQ-{String(i + 1).padStart(3, "0")}</td>
                   <td><strong>{p.display_name}</strong> <span className="small">({p.first_name} {p.last_name})</span></td>
                   <td>{p.gender === "female" ? "F" : "M"}</td>
                   <td>{p.level ?? "--"}</td>
+                  <td>{p.games_played}</td>
                   <td>{p.registration_status === "walk_in" ? "Walk-in" : "Registered"}</td>
                   <td><span className="badge gray">{ATT_LABEL[p.attendance_status]}</span></td>
                 </tr>
