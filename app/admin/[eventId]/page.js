@@ -588,14 +588,17 @@ function courtStatus(roundsWithMatches, courtNum) {
   return { current: scheduled[0] || null, next: scheduled[1] || null };
 }
 
-function CourtStatusBoard({ roundsWithMatches, byId }) {
+function CourtStatusBoard({ roundsWithMatches, byId, eventId }) {
   const numCourts = Math.max(0, ...roundsWithMatches.flatMap((r) => r.matches.map((m) => m.court)));
   if (numCourts === 0) return null;
   const name = (id) => byId[id]?.display_name || "?";
 
   return (
     <div className="card">
-      <h2>Court status</h2>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+        <h2 style={{ flex: 1 }}>Court status</h2>
+        <button className="small secondary" onClick={() => window.open(`${BASE_PATH}/live/${eventId}`, "_blank", "noopener,noreferrer")}>Open participant view</button>
+      </div>
       <p className="note" style={{ marginBottom: 10 }}>What's on each court right now, and what's already queued up next -- so a court doesn't have to sit idle waiting for the others to finish. Generate and publish the next round early to get it queued here.</p>
       <div className="courts">
         {Array.from({ length: numCourts }, (_, i) => i + 1).map((courtNum) => {
@@ -643,7 +646,7 @@ function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish,
   const showGenerateAheadNudge = ongoingPendingCount > 0 && upcoming.length === 0;
   return (
     <>
-      <CourtStatusBoard roundsWithMatches={roundsWithMatches} byId={byId} />
+      <CourtStatusBoard roundsWithMatches={roundsWithMatches} byId={byId} eventId={eventId} />
 
       <div className="card">
         <h2>Round generation</h2>
