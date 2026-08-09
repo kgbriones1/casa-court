@@ -9,12 +9,22 @@ function leaderboardFor(players, gender) {
   return [...list].sort((a, b) => b.point_diff - a.point_diff);
 }
 
+/** A court's own current/next match, independent of whether its round as a whole
+ * has finished -- mirrors the organizer's Match Control "Court status" exactly, so
+ * a court that's already moved on to a later round (because the organizer
+ * generated ahead) shows that immediately instead of still being bucketed under
+ * its old, already-scored round just because some other court hasn't finished. */
+function courtStatus(roundsWithMatches, courtNum) {
+  const sorted = [...roundsWithMatches].sort((a, b) => a.number - b.number);
+  const scheduled = sorted.flatMap((r) => r.matches.filter((m) => m.court === courtNum && m.status === "scheduled").map((m) => ({ ...m, roundNumber: r.number })));
+  return { current: scheduled[0] || null, next: scheduled[1] || null };
+}
+
 function classify(roundsWithMatches) {
-  const results = roundsWithMatches.filter((r) => r.matches.every((m) => m.status !== "scheduled"));
-  const notDone = roundsWithMatches.filter((r) => r.matches.some((m) => m.status === "scheduled"));
-  const ongoing = notDone[0] || null;
-  const upcoming = notDone.slice(1);
-  return { results, ongoing, upcoming };
+  const numCourts = Math.max(0, ...roundsWithMatches.flatMap((r) => r.matches.map((m) => m.court)));
+  const courts = Array.from({ length: numCourts }, (_, i) => i + 1).map((courtNum) => ({ courtNum, ...courtStatus(roundsWithMatches, courtNum) }));
+  const results = roundsWithMatches.filter((r) => r.matches.length > 0 && r.matches.every((m) => m.status !== "scheduled"));
+  return { courts, results };
 }
 
 /** Estimated clock time for a round, from the event's start time and round length --
@@ -68,6 +78,40 @@ function RoundCard({ round, event, byId, highlightId, badge }) {
   );
 }
 
+/** One court's current or next match for the Playing now / Up next sections --
+ * each court gets its own card since courts can legitimately be on different
+ * round numbers once the organizer starts generating ahead (see courtStatus). */
+function CourtMatchCard({ courtNum, match, event, byId, highlightId, badge }) {
+  const name = (id) => byId[id]?.display_name || "?";
+  if (!match) {
+    return (
+      <div className="court">
+        <div className="label">Court {courtNum}</div>
+        <p className="note">Free -- waiting for the next match.</p>
+      </div>
+    );
+  }
+  const involves = highlightId && [...match.team_a, ...match.team_b].includes(highlightId);
+  const timeRange = roundTimeRange(event, match.roundNumber);
+  return (
+    <div className="court" style={{ outline: involves ? "3px solid #c8923e" : "none" }}>
+      <div className="round-card-head" style={{ marginBottom: 6 }}>
+        <div>
+          <div className="label" style={{ marginBottom: 0 }}>Court {courtNum} &middot; Round {match.roundNumber}</div>
+          {timeRange && <div className="round-card-time">{timeRange}</div>}
+        </div>
+        <span className={`badge ${badge.color}`}>{badge.label}</span>
+      </div>
+      <p className="note" style={{ margin: "0 0 6px" }}>{matchTypeLabel(match, byId)}</p>
+      <div className="teams">
+        <div className="team">{match.team_a.map(name).join(" & ")}</div>
+        <div className="vs">VS</div>
+        <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
+      </div>
+    </div>
+  );
+}
+
 function LiveInner({ eventId }) {
   const [state, setState] = useState(null);
   const [tab, setTab] = useState("matches");
@@ -97,10 +141,10 @@ function LiveInner({ eventId }) {
   const { event, players, rounds, matches } = state;
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));
   const roundsWithMatches = rounds.map((r) => ({ ...r, matches: matches.filter((m) => m.round_id === r.id) }));
-  const { results, ongoing, upcoming } = classify(roundsWithMatches);
-  const ongoingSitting = ongoing
-    ? players.filter((p) => p.attendance_status === "checked_in" && !ongoing.matches.some((m) => [...m.team_a, ...m.team_b].includes(p.id))).map((p) => p.display_name)
-    : [];
+  const { results, courts } = classify(roundsWithMatches);
+  const activeIds = new Set(courts.flatMap((c) => (c.current ? [...c.current.team_a, ...c.current.team_b] : [])));
+  const bench = players.filter((p) => p.attendance_status === "checked_in" && !activeIds.has(p.id)).map((p) => p.display_name);
+  const courtsWithNext = courts.filter((c) => c.next);
 
   return (
     <div>
@@ -118,17 +162,25 @@ function LiveInner({ eventId }) {
               <input placeholder="Find your name..." value={search} onChange={(e) => setSearch(e.target.value)} style={{ width: "100%" }} />
               {matched && <p className="note">{matched.display_name} &middot; {matched.games_played} games &middot; {matched.point_diff > 0 ? "+" : ""}{matched.point_diff} pt diff</p>}
             </div>
-            {ongoing && (
+            {courts.length > 0 && (
               <>
                 <div className="section-title">Playing now</div>
-                <RoundCard round={ongoing} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Live", color: "red" }} />
-                {ongoingSitting.length > 0 && <div className="sitout">Resting: {ongoingSitting.join(", ")}</div>}
+                <div className="courts">
+                  {courts.map((c) => (
+                    <CourtMatchCard key={c.courtNum} courtNum={c.courtNum} match={c.current} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Live", color: "red" }} />
+                  ))}
+                </div>
+                {bench.length > 0 && <div className="sitout">Resting: {bench.join(", ")}</div>}
               </>
             )}
-            {upcoming.length > 0 && (
+            {courtsWithNext.length > 0 && (
               <>
                 <div className="section-title">Up next</div>
-                {upcoming.map((r) => <RoundCard key={r.id} round={r} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Upcoming", color: "gray" }} />)}
+                <div className="courts">
+                  {courtsWithNext.map((c) => (
+                    <CourtMatchCard key={c.courtNum} courtNum={c.courtNum} match={c.next} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Upcoming", color: "gray" }} />
+                  ))}
+                </div>
               </>
             )}
             {results.length > 0 && (
