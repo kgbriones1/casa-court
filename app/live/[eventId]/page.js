@@ -23,7 +23,13 @@ function courtStatus(roundsWithMatches, courtNum) {
 function classify(roundsWithMatches) {
   const numCourts = Math.max(0, ...roundsWithMatches.flatMap((r) => r.matches.map((m) => m.court)));
   const courts = Array.from({ length: numCourts }, (_, i) => i + 1).map((courtNum) => ({ courtNum, ...courtStatus(roundsWithMatches, courtNum) }));
-  const results = roundsWithMatches.filter((r) => r.matches.length > 0 && r.matches.every((m) => m.status !== "scheduled"));
+  // A round's finished matches must show up here even if the round as a whole
+  // isn't done yet (one court can finish while another in the same round is
+  // still playing) -- otherwise a court that's already moved on, per courtStatus
+  // above, leaves its just-completed match with nowhere to appear at all.
+  const results = roundsWithMatches
+    .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "scheduled") }))
+    .filter((r) => r.matches.length > 0);
   return { courts, results };
 }
 
