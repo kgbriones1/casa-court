@@ -37,6 +37,7 @@ create table players (
   points_against int not null default 0,
   point_diff int not null default 0,
   last_played_round int,
+  last_played_sequence int, -- highest matches.sequence among this player's non-cancelled matches; see lib/scheduler.js
   partner_ids uuid[] not null default '{}',
   opponent_counts jsonb not null default '{}',
   created_at timestamptz not null default now()
@@ -54,9 +55,14 @@ create table rounds (
 
 create table matches (
   id uuid primary key default gen_random_uuid(),
-  round_id uuid not null references rounds(id) on delete cascade,
+  round_id uuid references rounds(id) on delete cascade,
+    -- nullable: a "round" is a derived, display-only label (every courts-many
+    -- matches by generation order), not a real container every match belongs
+    -- to -- see lib/scheduler.js. Only matches from before the per-match
+    -- redesign have this set.
   event_id uuid not null references events(id) on delete cascade, -- denormalized, simplifies realtime filtering
   court int not null,
+  sequence int, -- monotonically increasing per event, assigned at generation time; see lib/scheduler.js
   division text not null default 'men' check (division in ('women','men','mixed','edge')),
     -- women's/men's doubles, mixed doubles, or an edge composition (uneven gender
     -- split, or a same-gender-pair-vs-same-gender-pair fallback) -- see lib/scheduler.js
@@ -65,7 +71,8 @@ create table matches (
   score_a int,
   score_b int,
   status text not null default 'scheduled', -- scheduled | completed | time_expired | cancelled | incomplete
-  completed_at timestamptz
+  completed_at timestamptz,
+  unique (event_id, sequence)
 );
 
 create table logs (
