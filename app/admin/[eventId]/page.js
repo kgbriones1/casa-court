@@ -1,8 +1,12 @@
 "use client";
 import { useEffect, useState, useMemo, useRef } from "react";
 import TopBar from "../../../components/TopBar";
-import { fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer, startEvent, endEvent, deleteEvent, publishRound, submitScore, correctScore, cancelMatch } from "../../../lib/db";
-import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel } from "../../../lib/scheduler";
+import {
+  fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer,
+  startEvent, endEvent, deleteEvent, publishMatches, submitScore, correctScore, cancelMatch,
+  invalidateMatch, editMatchPlayers, reassignCourt,
+} from "../../../lib/db";
+import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel, groupIntoRounds, roundOf, classify, reverseMatchHistory } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
 const ATT_COLOR = { not_arrived: "#8a8067", late: "#b58a2f", checked_in: "#2c6e3f", temporarily_unavailable: "#4C6E91", no_show: "#a83232", withdrawn: "#5b5142" };
@@ -42,9 +46,10 @@ function computeCapacity(event, registeredCount) {
  * rules lib/scheduler.test.js checks against a synthetic run. History integrity and the
  * checked_in-only eligibility rule aren't included here -- attendance status is mutable
  * after the fact, so re-checking it retroactively would be misleading; those two are
- * covered by the automated suite (npm test) instead, which controls for that. */
-function auditReport(players, roundsWithMatches) {
-  const activeRounds = roundsWithMatches
+ * covered by the automated suite (npm test) instead, which controls for that.
+ * `groupedRounds` is the derived (sequence-based) grouping, not the old rounds table. */
+function auditReport(players, groupedRounds) {
+  const activeRounds = groupedRounds
     .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "cancelled") }))
     .filter((r) => r.matches.length > 0)
     .sort((a, b) => a.number - b.number);
@@ -141,12 +146,39 @@ function auditReport(players, roundsWithMatches) {
   return rows;
 }
 
+/** Games played + average break length per player, color-coded so a stalled
+ * player (break of 2+) is visible at a glance without reading the queue by
+ * hand. Average break is the mean gap (in round-equivalents) between a
+ * player's own consecutive matches -- their first match has no prior break to
+ * measure, so it's excluded rather than counted as 0. */
+function pacingReport(players, matches, courts) {
+  const sequencesById = new Map(players.map((p) => [p.id, []]));
+  matches
+    .filter((m) => m.status !== "cancelled" && m.sequence != null)
+    .forEach((m) => {
+      [...m.team_a, ...m.team_b].forEach((id) => { if (sequencesById.has(id)) sequencesById.get(id).push(m.sequence); });
+    });
+
+  return players
+    .map((p) => {
+      const seqs = (sequencesById.get(p.id) || []).sort((a, b) => a - b);
+      const gaps = [];
+      for (let i = 1; i < seqs.length; i++) gaps.push(Math.max(0, roundOf(seqs[i], courts) - roundOf(seqs[i - 1], courts) - 1));
+      const avgBreak = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0;
+      return { id: p.id, display_name: p.display_name, attendance_status: p.attendance_status, games_played: p.games_played, avgBreak, hasHistory: gaps.length > 0 };
+    })
+    .sort((a, b) => b.avgBreak - a.avgBreak);
+}
+
+const PACE_COLOR = (avgBreak) => (avgBreak >= 2 ? "#a83232" : avgBreak >= 1 ? "#b58a2f" : "#2c6e3f");
+
 const AUDIT_BADGE = { pass: "green", warn: "amber", fail: "red", "n/a": "gray" };
 
 function AdminInner({ eventId }) {
-  const [state, setState] = useState(null); // {event, players, rounds, matches}
+  const [state, setState] = useState(null); // {event, players, matches}
   const [tab, setTab] = useState("dashboard");
-  const [draft, setDraft] = useState(null); // {matches, sitting, warnings, roundNumber}
+  const [draft, setDraft] = useState(null); // {matches, sitting, warnings, nextSequence}
+  const [matchCount, setMatchCount] = useState(null);
   const [genError, setGenError] = useState("");
   const [busy, setBusy] = useState(false);
   const [origin, setOrigin] = useState("");
@@ -172,26 +204,26 @@ function AdminInner({ eventId }) {
     </div>
   );
 
-  const { event, players, rounds, matches } = state;
+  const { event, players, matches } = state;
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));
-  const roundsWithMatches = rounds.map((r) => ({ ...r, matches: matches.filter((m) => m.round_id === r.id) }));
-  const lastPublished = roundsWithMatches[roundsWithMatches.length - 1];
-  const justPlayedIds = lastPublished ? new Set(lastPublished.matches.flatMap((m) => [...m.team_a, ...m.team_b])) : new Set();
+  const groupedRounds = groupIntoRounds(matches, event.courts);
+  const nextSequence = Math.max(0, ...matches.map((m) => m.sequence || 0)) + 1;
   const checkedInCount = players.filter((p) => p.attendance_status === "checked_in").length;
-  const completedRoundsCount = roundsWithMatches.filter((r) => r.matches.every((m) => m.status !== "scheduled")).length;
+  const completedRoundsCount = groupedRounds.filter((r) => r.matches.every((m) => m.status !== "scheduled")).length;
   const capacity = computeCapacity(event, players.length);
-  const auditRows = auditReport(players, roundsWithMatches);
+  const auditRows = auditReport(players, groupedRounds);
+  const pacing = pacingReport(players, matches, event.courts);
   const participantUrl = `${origin}${BASE_PATH}/live/${eventId}`;
 
-  const { pool: eligiblePool } = eligiblePlayers(players, new Set(), justPlayedIds);
+  const { pool: eligiblePool } = eligiblePlayers(players, matches, nextSequence, event.courts);
   const eligibleFemale = eligiblePool.filter((p) => p.gender === "female").length;
   const eligibleMale = eligiblePool.filter((p) => p.gender === "male").length;
+  const effectiveMatchCount = matchCount ?? event.courts;
 
   const generate = async () => {
     setGenError(""); setBusy(true);
     try {
-      const roundNumber = rounds.length + 1;
-      const res = generateDraft(players, event.courts, roundNumber, new Set(), justPlayedIds);
+      const res = generateDraft(players, matches, effectiveMatchCount, event.courts);
       if (res.error) { setGenError(res.error); return; }
       setDraft(res);
     } finally {
@@ -206,7 +238,7 @@ function AdminInner({ eventId }) {
   const publish = async () => {
     setGenError(""); setBusy(true);
     try {
-      await publishRound(eventId, draft.roundNumber, draft.matches, players);
+      await publishMatches(eventId, draft.matches, players, event.courts);
       setDraft(null);
       reload();
     } catch (err) {
@@ -220,7 +252,7 @@ function AdminInner({ eventId }) {
     <div>
       <TopBar
         title={event.name}
-        subtitle={`${event.ended ? "EVENT ENDED" : event.started_at ? `LIVE \u00B7 ROUND ${rounds.length}` : "NOT STARTED"} \u00B7 ${event.courts} courts`}
+        subtitle={`${event.ended ? "EVENT ENDED" : event.started_at ? `LIVE · ROUND ${groupedRounds.length}` : "NOT STARTED"} · ${event.courts} courts`}
         linkHome
       />
       <div className="layout">
@@ -245,7 +277,7 @@ function AdminInner({ eventId }) {
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <div>
                   <p style={{ margin: 0 }}><strong>{checkedInCount}</strong> checked in / {players.length} registered</p>
-                  <p className="note">Round {rounds.length} published &middot; {matches.filter((m) => m.status === "scheduled").length} matches awaiting a score</p>
+                  <p className="note">Round {groupedRounds.length} &middot; {matches.filter((m) => m.status === "scheduled").length} matches awaiting a score</p>
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
                   {!event.started_at && !event.ended && <button onClick={() => startEvent(eventId).then(reload)}>Start event</button>}
@@ -258,7 +290,7 @@ function AdminInner({ eventId }) {
               <div className="card"><div className="small">Participant target</div><div className="metric">{event.target_participants ?? "--"}</div></div>
               <div className="card"><div className="small">Registered</div><div className="metric">{players.length}</div></div>
               <div className="card"><div className="small">Checked in</div><div className="metric">{checkedInCount}</div></div>
-              <div className="card"><div className="small">Completed rounds</div><div className="metric">{completedRoundsCount}/{capacity ? capacity.plannedRounds : rounds.length}</div></div>
+              <div className="card"><div className="small">Completed rounds</div><div className="metric">{completedRoundsCount}/{capacity ? capacity.plannedRounds : groupedRounds.length}</div></div>
               <div className="card"><div className="small">Event duration</div><div className="metric">{capacity ? `${capacity.mins} min` : "--"}</div></div>
               <div className="card"><div className="small">Courts occupied</div><div className="metric">{event.courts}</div></div>
               <div className="card"><div className="small">{capacity ? `${capacity.roundMinutes}-minute rounds` : "Planned rounds"}</div><div className="metric">{capacity ? capacity.plannedRounds : "--"}</div></div>
@@ -286,6 +318,30 @@ function AdminInner({ eventId }) {
                   </p>
                 );
               })}
+            </div>
+
+            <div className="card">
+              <h2>Player pacing</h2>
+              <p className="note">Games played and average break length (in round-equivalents) between each player's own matches -- green 0&ndash;1, orange 1&ndash;2, red 2+ (at risk of an unacceptable break of 3).</p>
+              {pacing.every((p) => !p.hasHistory) ? (
+                <p className="note">Publish and play at least two rounds to see pacing data.</p>
+              ) : (
+                <div className="tablewrap">
+                  <table>
+                    <thead><tr><th>Player</th><th>Status</th><th>Games</th><th>Avg. break</th></tr></thead>
+                    <tbody>
+                      {pacing.filter((p) => p.hasHistory).map((p) => (
+                        <tr key={p.id}>
+                          <td>{p.display_name}</td>
+                          <td><span className="badge gray">{ATT_LABEL[p.attendance_status]}</span></td>
+                          <td>{p.games_played}</td>
+                          <td style={{ color: PACE_COLOR(p.avgBreak), fontWeight: 800 }}>{p.avgBreak.toFixed(1)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
             <div className="card">
@@ -326,19 +382,20 @@ function AdminInner({ eventId }) {
 
         {tab === "registrants" && <RegistrantsPanel eventId={eventId} players={players} reload={reload} />}
 
-        {tab === "checkin" && <CheckinPanel eventId={eventId} players={players} matches={matches} roundsWithMatches={roundsWithMatches} reload={reload} />}
+        {tab === "checkin" && <CheckinPanel eventId={eventId} players={players} matches={matches} reload={reload} />}
 
         {tab === "match" && (
           <MatchControlPanel
             draft={draft} setDraft={setDraft} genError={genError} busy={busy}
             generate={generate} publish={publish} byId={byId}
-            roundsWithMatches={roundsWithMatches} rounds={rounds}
-            eligibleFemale={eligibleFemale} eligibleMale={eligibleMale}
+            matches={matches} groupedRounds={groupedRounds} courts={event.courts}
+            matchCount={effectiveMatchCount} setMatchCount={setMatchCount}
+            eligiblePool={eligiblePool} eligibleFemale={eligibleFemale} eligibleMale={eligibleMale}
             eventId={eventId} players={players} reload={reload}
           />
         )}
 
-        {tab === "scores" && <ScoresPanel roundsWithMatches={roundsWithMatches} byId={byId} players={players} reload={reload} />}
+        {tab === "scores" && <ScoresPanel matches={matches} groupedRounds={groupedRounds} courts={event.courts} byId={byId} players={players} reload={reload} eventId={eventId} />}
 
         {tab === "leaderboard" && <LeaderboardPanel players={players} />}
 
@@ -444,7 +501,7 @@ function RegistrantsPanel({ eventId, players, reload }) {
   );
 }
 
-function CheckinPanel({ eventId, players, matches, roundsWithMatches, reload }) {
+function CheckinPanel({ eventId, players, matches, reload }) {
   const [walkIn, setWalkIn] = useState({ firstName: "", lastName: "", nickname: "", gender: "F", level: "" });
   const checkedInCount = players.filter((p) => p.attendance_status === "checked_in").length;
   const pendingCount = players.filter((p) => p.attendance_status === "not_arrived" || p.attendance_status === "late").length;
@@ -482,7 +539,7 @@ function CheckinPanel({ eventId, players, matches, roundsWithMatches, reload }) 
                       <button className="small secondary" disabled={p.attendance_status === "withdrawn"} onClick={() => {
                         const hasPending = matches.some((m) => m.status === "scheduled" && [...m.team_a, ...m.team_b].includes(p.id));
                         if (hasPending && !confirm(`${p.display_name} has a match in progress on their court. Checking out will cancel that match. Continue?`)) return;
-                        checkOutPlayer(eventId, p, matches, players, roundsWithMatches).then(reload);
+                        checkOutPlayer(eventId, p, matches, players).then(reload);
                       }}>Check out</button>
                     </span>
                   </td>
@@ -564,33 +621,19 @@ function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
   );
 }
 
-/** The oldest published round that still has an unscored match ("ongoing"), plus
- * every published round after it ("upcoming") -- same definition the participant
- * board uses for Playing now / Up next, reused here so Match Control's idea of
- * "current" and "next" per court matches what participants actually see. */
-function classifyRounds(roundsWithMatches) {
-  const sorted = [...roundsWithMatches].sort((a, b) => a.number - b.number);
-  const notDone = sorted.filter((r) => r.matches.some((m) => m.status === "scheduled"));
-  return { ongoing: notDone[0] || null, upcoming: notDone.slice(1) };
-}
-
-/** Per-court status must be checked per court, not borrowed from whether the round
- * as a whole is done -- a round can have one court already scored while its other
- * courts are still in progress, and that finished court is genuinely free even
- * though its round isn't "done" yet. Walks this court's matches across every
- * published round in order and takes the still-scheduled ones: the earliest is
- * "current," the one after that (if a later round is already published for this
- * court) is "next." */
-function courtStatus(roundsWithMatches, courtNum) {
-  const sorted = [...roundsWithMatches].sort((a, b) => a.number - b.number);
-  const scheduled = sorted
-    .flatMap((r) => r.matches.filter((m) => m.court === courtNum && m.status === "scheduled").map((m) => ({ ...m, roundNumber: r.number })));
+/** Current + next scheduled match per court, read straight off the flat matches
+ * list -- courts no longer need to share a round, so a court simply shows the
+ * earliest- and second-earliest-sequence match still awaiting a score. */
+function courtStatus(matches, courtNum, courts) {
+  const scheduled = matches
+    .filter((m) => m.court === courtNum && m.status === "scheduled")
+    .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
+    .map((m) => ({ ...m, roundNumber: m.sequence != null ? roundOf(m.sequence, courts) : null }));
   return { current: scheduled[0] || null, next: scheduled[1] || null };
 }
 
-function CourtStatusBoard({ roundsWithMatches, byId, eventId }) {
-  const numCourts = Math.max(0, ...roundsWithMatches.flatMap((r) => r.matches.map((m) => m.court)));
-  if (numCourts === 0) return null;
+function CourtStatusBoard({ matches, byId, eventId, courts }) {
+  if (!courts) return null;
   const name = (id) => byId[id]?.display_name || "?";
 
   return (
@@ -599,10 +642,10 @@ function CourtStatusBoard({ roundsWithMatches, byId, eventId }) {
         <h2 style={{ flex: 1 }}>Court status</h2>
         <button className="small secondary" onClick={() => window.open(`${BASE_PATH}/live/${eventId}`, "_blank", "noopener,noreferrer")}>Open participant view</button>
       </div>
-      <p className="note" style={{ marginBottom: 10 }}>What's on each court right now, and what's already queued up next -- so a court doesn't have to sit idle waiting for the others to finish. Generate and publish the next round early to get it queued here.</p>
+      <p className="note" style={{ marginBottom: 10 }}>What's on each court right now, and what's already queued up next -- so a court doesn't have to sit idle waiting for others to finish. Generate and publish ahead to get it queued here.</p>
       <div className="courts">
-        {Array.from({ length: numCourts }, (_, i) => i + 1).map((courtNum) => {
-          const { current, next } = courtStatus(roundsWithMatches, courtNum);
+        {Array.from({ length: courts }, (_, i) => i + 1).map((courtNum) => {
+          const { current, next } = courtStatus(matches, courtNum, courts);
           return (
             <div key={courtNum} className="court">
               <div className="label">Court {courtNum}</div>
@@ -634,60 +677,306 @@ function CourtStatusBoard({ roundsWithMatches, byId, eventId }) {
   );
 }
 
-function MatchControlPanel({ draft, setDraft, genError, busy, generate, publish, byId, roundsWithMatches, rounds, eligibleFemale, eligibleMale, eventId, players, reload }) {
-  const cancelMatchWithConfirm = (m) => {
-    const names = [...m.team_a, ...m.team_b].map((id) => byId[id]?.display_name).join(", ");
-    const reason = prompt(`Cancel Court ${m.court} (${names})? This can't be undone from the app.\n\nOptional reason (shown in the Event Log):`, "");
-    if (reason === null) return; // cancelled the prompt itself
-    cancelMatch(eventId, m, players, roundsWithMatches, reason).then(reload);
+/** Live feedback while hand-picking a manual match's 4 players -- mirrors the
+ * checks lib/scheduler.js applies automatically during generation, since a
+ * manual pick bypasses that selection entirely and needs the same visibility.
+ * `atSequence` is the sequence position to evaluate back-to-back against: the
+ * next unused one for a brand-new manual match, or the match's own existing
+ * sequence when editing one already in the queue (its position isn't moving). */
+function previewManualMatch(ids, byId, matches, courts, atSequence) {
+  const nextSequence = atSequence ?? Math.max(0, ...matches.map((m) => m.sequence || 0)) + 1;
+  const busyIds = new Set(matches.filter((m) => m.status === "scheduled").flatMap((m) => [...m.team_a, ...m.team_b]));
+  const warnings = [];
+
+  const conflicted = ids.filter((id) => busyIds.has(id));
+  if (conflicted.length) warnings.push(`${conflicted.map((id) => byId[id]?.display_name).join(", ")} already ${conflicted.length === 1 ? "has" : "have"} an unscored match in the queue.`);
+
+  const backToBack = ids.filter((id) => {
+    const p = byId[id];
+    return p?.last_played_sequence != null && roundOf(nextSequence, courts) <= roundOf(p.last_played_sequence, courts) + 1;
+  });
+  if (backToBack.length) warnings.push(`${backToBack.map((id) => byId[id]?.display_name).join(", ")} would be back-to-back from their last match.`);
+
+  const games = ids.map((id) => byId[id]?.games_played ?? 0);
+  if (games.length === 4 && Math.max(...games) - Math.min(...games) > 1) warnings.push("Uneven game counts among these 4 (spread > 1).");
+
+  return { warnings, nextSequence };
+}
+
+function ManualMatchCard({ eventId, players, byId, matches, courts, reload }) {
+  const [open, setOpen] = useState(false);
+  const [a1, setA1] = useState(""); const [a2, setA2] = useState("");
+  const [b1, setB1] = useState(""); const [b2, setB2] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const chosen = [a1, a2, b1, b2].filter(Boolean);
+  const distinct = new Set(chosen).size === chosen.length;
+  const ready = chosen.length === 4 && distinct;
+  const preview = ready ? previewManualMatch(chosen, byId, matches, courts) : null;
+  const sorted = [...players].sort((x, y) => x.display_name.localeCompare(y.display_name));
+  const optionsExcluding = (except) => sorted.filter((p) => !chosen.includes(p.id) || p.id === except);
+
+  const create = async () => {
+    if (!ready) return;
+    setSaving(true); setError("");
+    try {
+      const match = { team_a: [a1, a2], team_b: [b1, b2], score_a: null, score_b: null, status: "scheduled", division: classify({ team_a: [a1, a2], team_b: [b1, b2] }, byId), sequence: preview.nextSequence };
+      await publishMatches(eventId, [match], players, courts);
+      setA1(""); setA2(""); setB1(""); setB2(""); setOpen(false);
+      reload();
+    } catch (err) {
+      setError(`Couldn't create the match: ${err.message || err}`);
+    } finally {
+      setSaving(false);
+    }
   };
-  const { ongoing, upcoming } = classifyRounds(roundsWithMatches);
-  const ongoingPendingCount = ongoing ? ongoing.matches.filter((m) => m.status === "scheduled").length : 0;
-  const showGenerateAheadNudge = ongoingPendingCount > 0 && upcoming.length === 0;
+
+  if (!open) return (
+    <div className="card">
+      <h2>Manual match</h2>
+      <p className="note">Hand-pick all 4 players for a one-off match -- overrides automatic selection entirely, e.g. to seat a specific rematch or fill a gap the algorithm wouldn't choose.</p>
+      <button className="small secondary" onClick={() => setOpen(true)}>Build a manual match</button>
+    </div>
+  );
+
+  return (
+    <div className="card">
+      <h2>Manual match</h2>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <div>
+          <p className="small" style={{ margin: "0 0 4px", fontWeight: 700 }}>Team A</p>
+          <select value={a1} onChange={(e) => setA1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
+            <option value="">Pick a player...</option>
+            {optionsExcluding(a1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+          <select value={a2} onChange={(e) => setA2(e.target.value)} style={{ width: "100%" }}>
+            <option value="">Pick a player...</option>
+            {optionsExcluding(a2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+        </div>
+        <div>
+          <p className="small" style={{ margin: "0 0 4px", fontWeight: 700 }}>Team B</p>
+          <select value={b1} onChange={(e) => setB1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
+            <option value="">Pick a player...</option>
+            {optionsExcluding(b1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+          <select value={b2} onChange={(e) => setB2(e.target.value)} style={{ width: "100%" }}>
+            <option value="">Pick a player...</option>
+            {optionsExcluding(b2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+        </div>
+      </div>
+      {chosen.length === 4 && !distinct && <div className="error-box">Pick 4 different players.</div>}
+      {preview?.warnings.map((w, i) => <div key={i} className="warn-box">{w}</div>)}
+      {error && <div className="error-box">{error}</div>}
+      <div className="row" style={{ marginTop: 10 }}>
+        <button disabled={!ready || saving} onClick={create}>Create match</button>
+        <button className="secondary" onClick={() => { setOpen(false); setA1(""); setA2(""); setB1(""); setB2(""); setError(""); }}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+/** Inline players editor for an unscored match -- lets the organizer swap in a
+ * walk-in or correct a mistaken pairing, with the same live warnings as the
+ * manual match builder. Reuses editMatchPlayers's full history backtrace. */
+function EditPlayersForm({ eventId, match, players, byId, matches, courts, reload, onClose }) {
+  const [a1, setA1] = useState(match.team_a[0]); const [a2, setA2] = useState(match.team_a[1]);
+  const [b1, setB1] = useState(match.team_b[0]); const [b2, setB2] = useState(match.team_b[1]);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const chosen = [a1, a2, b1, b2];
+  const distinct = new Set(chosen).size === 4;
+  const otherMatches = matches.filter((m) => m.id !== match.id);
+  // This match's own current players already have last_played_sequence set to
+  // this match's sequence -- previewing against raw byId would spuriously flag
+  // them as "back-to-back from their last match" (which is circular: this IS
+  // their last match). Reverse its effect first, same as editMatchPlayers does
+  // for real, so the preview reflects what's actually true if they're kept.
+  const reversedById = useMemo(() => {
+    const working = Object.fromEntries(players.map((p) => [p.id, p]));
+    reverseMatchHistory(match, players, matches).forEach((r) => { working[r.id] = { ...working[r.id], ...r }; });
+    return working;
+  }, [match, players, matches]);
+  const preview = distinct ? previewManualMatch(chosen, reversedById, otherMatches, courts, match.sequence) : null;
+  const sorted = [...players].sort((x, y) => x.display_name.localeCompare(y.display_name));
+  const optionsExcluding = (except) => sorted.filter((p) => !chosen.includes(p.id) || p.id === except);
+
+  const save = async () => {
+    if (!distinct) return;
+    setSaving(true); setError("");
+    try {
+      await editMatchPlayers(eventId, match, [a1, a2], [b1, b2], players, matches);
+      onClose();
+      reload();
+    } catch (err) {
+      setError(`Couldn't save: ${err.message || err}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed var(--line)" }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <div>
+          <select value={a1} onChange={(e) => setA1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
+            {optionsExcluding(a1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+          <select value={a2} onChange={(e) => setA2(e.target.value)} style={{ width: "100%" }}>
+            {optionsExcluding(a2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+        </div>
+        <div>
+          <select value={b1} onChange={(e) => setB1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
+            {optionsExcluding(b1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+          <select value={b2} onChange={(e) => setB2(e.target.value)} style={{ width: "100%" }}>
+            {optionsExcluding(b2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+          </select>
+        </div>
+      </div>
+      {!distinct && <div className="error-box">Pick 4 different players.</div>}
+      {preview?.warnings.map((w, i) => <div key={i} className="warn-box">{w}</div>)}
+      {error && <div className="error-box">{error}</div>}
+      <div className="row" style={{ marginTop: 8 }}>
+        <button className="small" disabled={!distinct || saving} onClick={save}>Save players</button>
+        <button className="small secondary" onClick={onClose}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+/** One scheduled (not-yet-played) match's full Match Control controls: its
+ * predicted court (editable -- a true swap with whoever else holds the target
+ * court), edit-players, and cancel. */
+function QueueMatchCard({ eventId, match, byId, players, matches, courts, reload }) {
+  const [editing, setEditing] = useState(false);
+  const name = (id) => byId[id]?.display_name || "?";
+  const roundNumber = match.sequence != null ? roundOf(match.sequence, courts) : null;
+
+  const cancelWithConfirm = () => {
+    const names = [...match.team_a, ...match.team_b].map(name).join(", ");
+    const reason = prompt(`Cancel Court ${match.court} (${names})? This can't be undone from the app.\n\nOptional reason (shown in the Event Log):`, "");
+    if (reason === null) return;
+    cancelMatch(eventId, match, players, matches, reason).then(reload);
+  };
+
+  return (
+    <div className="court" style={{ borderLeft: "4px solid #c8923e" }}>
+      <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+        <div className="label" style={{ marginBottom: 0 }}>Round {roundNumber} &middot; {matchTypeLabel(match, byId)}</div>
+        <label className="small" style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          Court
+          <select
+            value={match.court}
+            onChange={(e) => reassignCourt(eventId, matches, players, match.id, parseInt(e.target.value, 10)).then(reload)}
+          >
+            {Array.from({ length: courts }, (_, i) => i + 1).map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </label>
+      </div>
+      <div className="teams">
+        <div className="team">{match.team_a.map(name).join(" & ")}</div>
+        <div className="vs">VS</div>
+        <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
+      </div>
+      <div className="row" style={{ marginTop: 8 }}>
+        <button className="small secondary" onClick={() => setEditing((v) => !v)}>{editing ? "Close" : "Edit players"}</button>
+        <button className="small secondary" style={{ color: "#993d38" }} onClick={cancelWithConfirm}>Cancel match</button>
+      </div>
+      {editing && (
+        <EditPlayersForm eventId={eventId} match={match} players={players} byId={byId} matches={matches} courts={courts} reload={reload} onClose={() => setEditing(false)} />
+      )}
+    </div>
+  );
+}
+
+function MatchControlPanel({
+  draft, setDraft, genError, busy, generate, publish, byId,
+  matches, groupedRounds, courts, matchCount, setMatchCount,
+  eligiblePool, eligibleFemale, eligibleMale, eventId, players, reload,
+}) {
+  const [swapA, setSwapA] = useState("");
+  const [swapB, setSwapB] = useState("");
+  const queue = matches.filter((m) => m.status === "scheduled").sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+
+  const applySwap = () => {
+    if (!swapA || !swapB || swapA === swapB) return;
+    setDraft({ ...draft, matches: swapPlayers(draft.matches, swapA, swapB) });
+    setSwapA(""); setSwapB("");
+  };
+
+  const draftPlayerIds = draft ? draft.matches.flatMap((m) => [...m.team_a, ...m.team_b]) : [];
+
   return (
     <>
-      <CourtStatusBoard roundsWithMatches={roundsWithMatches} byId={byId} eventId={eventId} />
+      <CourtStatusBoard matches={matches} byId={byId} eventId={eventId} courts={courts} />
 
       <div className="card">
-        <h2>Round generation</h2>
-        {!draft && showGenerateAheadNudge && (
-          <div className="warn-box">
-            Round {ongoing.number} still has {ongoingPendingCount} match{ongoingPendingCount === 1 ? "" : "es"} in progress -- you can generate and publish the next round now so courts don't sit idle when they finish. It'll show up in Court status above as each court's "Next."
-          </div>
+        <h2>Generate matches</h2>
+        {!draft && (
+          <>
+            <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible right now ({eligibleFemale + eligibleMale} total). Matchmaking is gender-blind and real-time -- it only ever excludes someone currently in an unscored match or back-to-back from their last one.</p>
+            <label className="small" style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
+              Matches to generate
+              <input type="number" min={1} max={20} value={matchCount} onChange={(e) => setMatchCount(Math.max(1, parseInt(e.target.value, 10) || 1))} style={{ width: 70 }} />
+            </label>
+          </>
         )}
-        {!draft && <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible this round ({eligibleFemale + eligibleMale} total). Matchmaking is gender-blind -- anyone can be partnered with or matched against anyone, based on balance, rest, and never repeating a partner.</p>}
         {draft ? (
           <>
-            <p className="note" style={{ fontFamily: "monospace", color: "#4C6E91" }}>DRAFT -- ROUND {draft.roundNumber} -- NOT PUBLISHED</p>
+            <p className="note" style={{ fontFamily: "monospace", color: "#4C6E91" }}>DRAFT -- {draft.matches.length} MATCH{draft.matches.length === 1 ? "" : "ES"} -- NOT PUBLISHED</p>
             {draft.warnings.map((w, i) => <div key={i} className="warn-box">{w}</div>)}
             <div className="courts">
-              {draft.matches.map((m) => <MatchCard key={m.court} byId={byId} match={m} draft editable={false} />)}
+              {draft.matches.map((m, i) => <MatchCard key={i} byId={byId} match={{ ...m, court: ((m.sequence - 1) % courts) + 1 }} draft editable={false} />)}
             </div>
             {draft.sitting.length > 0 && <div className="sitout">Sitting: {draft.sitting.map((id) => byId[id]?.display_name).join(", ")}</div>}
-            <div className="row">
+            <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed var(--line)" }}>
+              <p className="small" style={{ fontWeight: 700, marginBottom: 4 }}>Manual swap (before publishing)</p>
+              <div className="row">
+                <select value={swapA} onChange={(e) => setSwapA(e.target.value)}>
+                  <option value="">Player A...</option>
+                  {draftPlayerIds.map((id) => <option key={id} value={id}>{byId[id]?.display_name}</option>)}
+                </select>
+                <select value={swapB} onChange={(e) => setSwapB(e.target.value)}>
+                  <option value="">Player B...</option>
+                  {draftPlayerIds.map((id) => <option key={id} value={id}>{byId[id]?.display_name}</option>)}
+                </select>
+                <button className="small secondary" onClick={applySwap} disabled={!swapA || !swapB || swapA === swapB}>Swap</button>
+              </div>
+            </div>
+            <div className="row" style={{ marginTop: 10 }}>
               <button className="secondary" onClick={generate} disabled={busy}>Regenerate</button>
-              <button onClick={publish} disabled={busy}>Publish round {draft.roundNumber}</button>
+              <button onClick={publish} disabled={busy}>Publish {draft.matches.length} match{draft.matches.length === 1 ? "" : "es"}</button>
               <button className="secondary" onClick={() => setDraft(null)}>Cancel draft</button>
             </div>
-            <p className="note">Manual swap: not built into this UI yet -- regenerate re-runs the optimizer if a draft looks off.</p>
           </>
         ) : (
-          <button onClick={generate} disabled={busy}>Generate draft round {rounds.length + 1}</button>
+          <button onClick={generate} disabled={busy}>Generate {matchCount} draft match{matchCount === 1 ? "" : "es"}</button>
         )}
         {genError && <div className="error-box">{genError}</div>}
       </div>
 
-      {[...roundsWithMatches].reverse().map((r) => (
-        <div key={r.id}>
-          <div className="round-title">PUBLISHED -- ROUND {r.number}</div>
-          <div className="courts">{r.matches.map((m) => <MatchCard key={m.id} byId={byId} match={m} editable={false} onCancel={() => cancelMatchWithConfirm(m)} />)}</div>
+      <ManualMatchCard eventId={eventId} players={players} byId={byId} matches={matches} courts={courts} reload={reload} />
+
+      <div className="card">
+        <h2>Queue ({queue.length})</h2>
+        <p className="note">Published matches still awaiting a score, in the order they'll be played.</p>
+        {queue.length === 0 && <p className="note">Nothing queued -- generate and publish above.</p>}
+        <div className="courts">
+          {queue.map((m) => (
+            <QueueMatchCard key={m.id} eventId={eventId} match={m} byId={byId} players={players} matches={matches} courts={courts} reload={reload} />
+          ))}
         </div>
-      ))}
+      </div>
     </>
   );
 }
 
-function CorrectableMatchCard({ byId, match, players, reload }) {
+function CorrectableMatchCard({ eventId, byId, match, players, matches, reload }) {
   const [editing, setEditing] = useState(false);
   const [a, setA] = useState(match.score_a);
   const [b, setB] = useState(match.score_b);
@@ -698,6 +987,13 @@ function CorrectableMatchCard({ byId, match, players, reload }) {
     if (sa === match.score_a && sb === match.score_b) { setEditing(false); return; }
     correctScore(match, match.score_a, match.score_b, sa, sb, players).then(() => { setEditing(false); reload(); });
   };
+  const invalidate = () => {
+    const names = [...match.team_a, ...match.team_b].map(name).join(", ");
+    const typed = prompt(`This permanently reverses both the result (${match.score_a}-${match.score_b}) and the assignment history for ${names} -- it changes standings retroactively. This is different from a normal cancel and can't be undone from the app.\n\nType INVALIDATE to confirm:`, "");
+    if (typed !== "INVALIDATE") return;
+    const reason = prompt("Optional reason (shown in the Event Log):", "") || "";
+    invalidateMatch(eventId, match, players, matches, reason).then(reload).catch((err) => alert(`Couldn't invalidate: ${err.message || err}`));
+  };
   return (
     <div className="court">
       <div className="label">Court {match.court} &middot; {matchTypeLabel(match, byId)}</div>
@@ -707,9 +1003,12 @@ function CorrectableMatchCard({ byId, match, players, reload }) {
         <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
       </div>
       {!editing ? (
-        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", flexWrap: "nowrap" }}>
+        <div className="row" style={{ justifyContent: "space-between", alignItems: "center", flexWrap: "wrap" }}>
           <p className="match-score" style={{ margin: 0 }}>{match.score_a}-{match.score_b}{match.status === "time_expired" ? " (time expired)" : ""}</p>
-          <button className="small secondary" onClick={() => { setA(match.score_a); setB(match.score_b); setEditing(true); }}>Edit score</button>
+          <span style={{ display: "flex", gap: 4 }}>
+            <button className="small secondary" onClick={() => { setA(match.score_a); setB(match.score_b); setEditing(true); }}>Edit score</button>
+            <button className="small secondary" style={{ color: "#993d38" }} onClick={invalidate}>Invalidate</button>
+          </span>
         </div>
       ) : (
         <div className="scorerow">
@@ -724,23 +1023,21 @@ function CorrectableMatchCard({ byId, match, players, reload }) {
   );
 }
 
-function ScoresPanel({ roundsWithMatches, byId, players, reload }) {
-  const pending = roundsWithMatches.flatMap((r) => r.matches.filter((m) => m.status === "scheduled").map((m) => ({ ...m, roundNumber: r.number })));
-  const scoredRounds = [...roundsWithMatches]
+function ScoresPanel({ matches, groupedRounds, courts, byId, players, reload, eventId }) {
+  const pending = matches
+    .filter((m) => m.status === "scheduled")
+    .map((m) => ({ ...m, roundNumber: m.sequence != null ? roundOf(m.sequence, courts) : null }))
+    .sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+  const scoredRounds = [...groupedRounds]
     .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "scheduled" && m.status !== "cancelled") }))
     .filter((r) => r.matches.length > 0)
     .reverse();
 
-  // What's already queued for this same court in a later published round, if any --
-  // so scoring this match and freeing the court doesn't mean checking Match Control
-  // separately to know who's up next on it.
+  // What's already queued for this same court, if any -- so scoring this match
+  // and freeing the court doesn't mean checking Match Control separately.
   const nextOnCourt = (m) => {
-    const later = roundsWithMatches.filter((r) => r.number > m.roundNumber).sort((a, b) => a.number - b.number);
-    for (const r of later) {
-      const nm = r.matches.find((mm) => mm.court === m.court);
-      if (nm) return { match: nm, roundNumber: r.number };
-    }
-    return null;
+    const later = matches.filter((mm) => mm.court === m.court && mm.status === "scheduled" && (mm.sequence || 0) > (m.sequence || 0)).sort((a, b) => a.sequence - b.sequence);
+    return later[0] || null;
   };
   const name = (id) => byId[id]?.display_name || "?";
 
@@ -758,7 +1055,7 @@ function ScoresPanel({ roundsWithMatches, byId, players, reload }) {
                 <MatchCard byId={byId} match={m} editable onScore={(a, b, status) => submitScore(m, a, b, players, status).then(reload)} />
                 {next && (
                   <p className="note" style={{ marginTop: 4 }}>
-                    Once scored, Court {m.court} is next up for Round {next.roundNumber}: {next.match.team_a.map(name).join(" & ")} vs {next.match.team_b.map(name).join(" & ")}
+                    Once scored, Court {m.court} is next up: {next.team_a.map(name).join(" & ")} vs {next.team_b.map(name).join(" & ")}
                   </p>
                 )}
               </div>
@@ -769,12 +1066,12 @@ function ScoresPanel({ roundsWithMatches, byId, players, reload }) {
 
       <div className="card">
         <h2>Completed matches ({scoredRounds.reduce((n, r) => n + r.matches.length, 0)})</h2>
-        <p className="note" style={{ marginBottom: 10 }}>Wrong score entered? Click "Edit score" -- stats are reversed and reapplied, and it's logged.</p>
+        <p className="note" style={{ marginBottom: 10 }}>Wrong score entered? Click "Edit score" -- stats are reversed and reapplied, and it's logged. "Invalidate" fully undoes a match (results AND assignment history) -- use it only when the match itself shouldn't count at all.</p>
         {scoredRounds.length === 0 && <p className="note">No scored matches yet.</p>}
         {scoredRounds.map((r) => (
-          <div key={r.id}>
+          <div key={r.number}>
             <div className="round-title">ROUND {r.number}</div>
-            <div className="courts">{r.matches.map((m) => <CorrectableMatchCard key={m.id} byId={byId} match={m} players={players} reload={reload} />)}</div>
+            <div className="courts">{r.matches.map((m) => <CorrectableMatchCard key={m.id} eventId={eventId} byId={byId} match={m} players={players} matches={matches} reload={reload} />)}</div>
           </div>
         ))}
       </div>

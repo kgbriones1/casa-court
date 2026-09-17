@@ -2,7 +2,7 @@
 import { useEffect, useMemo, useState } from "react";
 import TopBar from "../../../components/TopBar";
 import { fetchFullEvent, subscribeEvent } from "../../../lib/db";
-import { matchTypeLabel } from "../../../lib/scheduler";
+import { matchTypeLabel, groupIntoRounds, roundOf } from "../../../lib/scheduler";
 
 function leaderboardFor(players, gender) {
   const list = gender === "overall" ? players : players.filter((p) => p.gender === gender);
@@ -11,26 +11,29 @@ function leaderboardFor(players, gender) {
 
 /** A court's own current/next match, independent of whether its round as a whole
  * has finished -- mirrors the organizer's Match Control "Court status" exactly, so
- * a court that's already moved on to a later round (because the organizer
+ * a court that's already moved on to a later match (because the organizer
  * generated ahead) shows that immediately instead of still being bucketed under
- * its old, already-scored round just because some other court hasn't finished. */
-function courtStatus(roundsWithMatches, courtNum) {
-  const sorted = [...roundsWithMatches].sort((a, b) => a.number - b.number);
-  const scheduled = sorted.flatMap((r) => r.matches.filter((m) => m.court === courtNum && m.status === "scheduled").map((m) => ({ ...m, roundNumber: r.number })));
+ * its old, already-scored round just because some other court hasn't finished.
+ * Read straight off the flat matches list -- courts no longer share a round. */
+function courtStatus(matches, courtNum, courts) {
+  const scheduled = matches
+    .filter((m) => m.court === courtNum && m.status === "scheduled")
+    .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
+    .map((m) => ({ ...m, roundNumber: m.sequence != null ? roundOf(m.sequence, courts) : null }));
   return { current: scheduled[0] || null, next: scheduled[1] || null };
 }
 
-function classify(roundsWithMatches) {
-  const numCourts = Math.max(0, ...roundsWithMatches.flatMap((r) => r.matches.map((m) => m.court)));
-  const courts = Array.from({ length: numCourts }, (_, i) => i + 1).map((courtNum) => ({ courtNum, ...courtStatus(roundsWithMatches, courtNum) }));
+function classifyBoard(matches, courts) {
+  const courtsList = Array.from({ length: courts }, (_, i) => i + 1).map((courtNum) => ({ courtNum, ...courtStatus(matches, courtNum, courts) }));
   // A round's finished matches must show up here even if the round as a whole
   // isn't done yet (one court can finish while another in the same round is
   // still playing) -- otherwise a court that's already moved on, per courtStatus
   // above, leaves its just-completed match with nowhere to appear at all.
-  const results = roundsWithMatches
+  const groupedRounds = groupIntoRounds(matches, courts);
+  const results = groupedRounds
     .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "scheduled") }))
     .filter((r) => r.matches.length > 0);
-  return { courts, results };
+  return { courts: courtsList, results };
 }
 
 /** Estimated clock time for a round, from the event's start time and round length --
@@ -85,8 +88,8 @@ function RoundCard({ round, event, byId, highlightId, badge }) {
 }
 
 /** One court's current or next match for the Playing now / Up next sections --
- * each court gets its own card since courts can legitimately be on different
- * round numbers once the organizer starts generating ahead (see courtStatus). */
+ * each court gets its own card since courts can legitimately be ahead of others
+ * once the organizer starts generating ahead (see courtStatus). */
 function CourtMatchCard({ courtNum, match, event, byId, highlightId, badge }) {
   const name = (id) => byId[id]?.display_name || "?";
   if (!match) {
@@ -144,17 +147,17 @@ function LiveInner({ eventId }) {
   if (state === null) return <div className="wrap"><div className="card">Loading...</div></div>;
   if (!state.event) return <div className="wrap"><div className="card">Event not found -- this link may be outdated. Ask the organizer for the current QR code or link.</div></div>;
 
-  const { event, players, rounds, matches } = state;
+  const { event, players, matches } = state;
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));
-  const roundsWithMatches = rounds.map((r) => ({ ...r, matches: matches.filter((m) => m.round_id === r.id) }));
-  const { results, courts } = classify(roundsWithMatches);
+  const groupedRounds = groupIntoRounds(matches, event.courts);
+  const { results, courts } = classifyBoard(matches, event.courts);
   const activeIds = new Set(courts.flatMap((c) => (c.current ? [...c.current.team_a, ...c.current.team_b] : [])));
   const bench = players.filter((p) => p.attendance_status === "checked_in" && !activeIds.has(p.id)).map((p) => p.display_name);
   const courtsWithNext = courts.filter((c) => c.next);
 
   return (
     <div>
-      <TopBar title={event.name} subtitle={event.ended ? "Event ended" : `Round ${rounds.length} \u00B7 Live board`} large />
+      <TopBar title={event.name} subtitle={event.ended ? "Event ended" : `Round ${groupedRounds.length} · Live board`} large />
       <div className="wrap participant">
         <div className="tabs" style={{ marginTop: 14 }}>
           <button className={tab === "matches" ? "active" : ""} onClick={() => setTab("matches")}>Matches</button>
@@ -192,7 +195,7 @@ function LiveInner({ eventId }) {
             {results.length > 0 && (
               <>
                 <div className="section-title">Results</div>
-                {[...results].reverse().map((r) => <RoundCard key={r.id} round={r} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Completed", color: "blue" }} />)}
+                {[...results].reverse().map((r) => <RoundCard key={r.number} round={r} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Completed", color: "blue" }} />)}
               </>
             )}
           </>
@@ -211,7 +214,7 @@ function LiveInner({ eventId }) {
               <tbody>
                 {leaderboardFor(players, lbTab).map((p, i) => (
                   <tr key={p.id}>
-                    <td>{i + 1}</td><td>{p.display_name}{i === 0 && p.games_played > 0 && lbTab !== "overall" ? " \uD83D\uDC51" : ""}</td>
+                    <td>{i + 1}</td><td>{p.display_name}{i === 0 && p.games_played > 0 && lbTab !== "overall" ? " 👑" : ""}</td>
                     <td>{p.wins}-{p.losses}</td>
                     <td className={p.point_diff > 0 ? "diffpos" : p.point_diff < 0 ? "diffneg" : ""}>{p.point_diff > 0 ? "+" : ""}{p.point_diff}</td>
                   </tr>
