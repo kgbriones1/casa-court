@@ -146,6 +146,44 @@ function auditReport(players, groupedRounds) {
   return rows;
 }
 
+/** Breaks every played match down into the 4 composition categories the
+ * matchmaking cost function actually scores against (see lib/scheduler.js's
+ * compositionPenalty): same-sex (women's or men's doubles) and mixed-vs-mixed
+ * are free (tier 0); mixed-vs-single-gender is lightly discouraged (tier 1,
+ * often an unavoidable uneven split); a single-gender pair against the
+ * opposite single-gender pair is heavily discouraged (tier 2). Ideal shape is
+ * most matches in the first two categories, with tier 2 the smallest slice --
+ * ideally zero -- if there's any spillover at all. */
+function compositionReport(matches, byId) {
+  const active = matches.filter((m) => m.status !== "cancelled");
+  if (active.length === 0) return null;
+
+  const counts = { sameSex: 0, mixedVsMixed: 0, mixedVsSingle: 0, menVsWomen: 0 };
+  active.forEach((m) => {
+    const teamAMixed = byId[m.team_a[0]]?.gender !== byId[m.team_a[1]]?.gender;
+    const teamBMixed = byId[m.team_b[0]]?.gender !== byId[m.team_b[1]]?.gender;
+    if (teamAMixed && teamBMixed) counts.mixedVsMixed++;
+    else if (!teamAMixed && !teamBMixed) {
+      if (byId[m.team_a[0]]?.gender === byId[m.team_b[0]]?.gender) counts.sameSex++;
+      else counts.menVsWomen++;
+    } else counts.mixedVsSingle++;
+  });
+
+  const total = active.length;
+  const rows = [
+    { label: "Same-sex (women's or men's doubles)", count: counts.sameSex },
+    { label: "Mixed vs mixed", count: counts.mixedVsMixed },
+    { label: "Mixed vs single-gender", count: counts.mixedVsSingle },
+    { label: "Men's pair vs women's pair", count: counts.menVsWomen },
+  ].map((r) => ({ ...r, pct: r.count / total }));
+
+  const idealPct = (counts.sameSex + counts.mixedVsMixed) / total;
+  const hasSpillover = counts.mixedVsSingle + counts.menVsWomen > 0;
+  const result = idealPct > 0.5 && counts.menVsWomen === 0 ? "pass" : counts.menVsWomen <= counts.mixedVsSingle ? "warn" : "fail";
+
+  return { rows, total, result, hasSpillover };
+}
+
 /** Games played + average break length per player, color-coded so a stalled
  * player (break of 2+) is visible at a glance without reading the queue by
  * hand. Average break is the mean gap (in round-equivalents) between a
@@ -212,6 +250,7 @@ function AdminInner({ eventId }) {
   const completedRoundsCount = groupedRounds.filter((r) => r.matches.every((m) => m.status !== "scheduled")).length;
   const capacity = computeCapacity(event, players.length);
   const auditRows = auditReport(players, groupedRounds);
+  const composition = compositionReport(matches, byId);
   const pacing = pacingReport(players, matches, event.courts);
   const participantUrl = `${origin}${BASE_PATH}/live/${eventId}`;
 
@@ -341,6 +380,39 @@ function AdminInner({ eventId }) {
                     </tbody>
                   </table>
                 </div>
+              )}
+            </div>
+
+            <div className="card">
+              <h2>Match composition</h2>
+              <p className="note">Same-sex and mixed-vs-mixed are the free, unpenalized shapes -- majority of matches should land there. Mixed-vs-single-gender is a light spillover (often an unavoidable uneven split); men's-pair-vs-women's-pair is the heavily discouraged one and should be the smallest slice, ideally zero.</p>
+              {composition === null ? (
+                <p className="note">Publish and play at least one match to see a breakdown.</p>
+              ) : (
+                <>
+                  <div className="tablewrap">
+                    <table>
+                      <thead><tr><th>Composition</th><th>Matches</th><th>%</th></tr></thead>
+                      <tbody>
+                        {composition.rows.map((r) => (
+                          <tr key={r.label}>
+                            <td>{r.label}</td>
+                            <td>{r.count}</td>
+                            <td>{(r.pct * 100).toFixed(0)}%</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="note" style={{ marginTop: 8 }}>
+                    <span className={`badge ${AUDIT_BADGE[composition.result]}`}>{composition.result}</span>{" "}
+                    {composition.result === "pass"
+                      ? "Majority of matches are the free compositions, with no men's-vs-women's pairings."
+                      : composition.result === "warn"
+                      ? "Some spillover into the discouraged compositions, but men's-vs-women's stays the smallest slice, as expected when it's unavoidable."
+                      : "Men's-vs-women's pairings outnumber the lighter mixed-vs-single spillover -- worth checking whether this was avoidable (e.g. a lopsided gender split forcing it more than expected)."}
+                  </p>
+                </>
               )}
             </div>
 
