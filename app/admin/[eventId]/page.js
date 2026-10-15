@@ -1040,6 +1040,9 @@ function MatchControlPanel({
   const queue = [...live, ...queued];
   const queuePosition = Object.fromEntries(queued.map((m, i) => [m.id, i + 1]));
   const liveCourts = new Set(live.map((m) => m.court));
+  const renderCard = (m) => (
+    <QueueMatchCard key={m.id} eventId={eventId} match={m} byId={byId} players={players} matches={matches} courts={courts} reload={reload} queuePosition={queuePosition[m.id] ?? null} />
+  );
 
   const setDraftCourt = (index, court) => setDraft({ ...draft, matches: draft.matches.map((m, i) => (i === index ? { ...m, court } : m)) });
   const fillFreeCourts = () => {
@@ -1129,11 +1132,18 @@ function MatchControlPanel({
         <h2>Matches awaiting a score ({queue.length})</h2>
         <p className="note">Matches on a court are live; the rest wait in the queue, numbered in the order they'll be called. Assign a court to put a queued match live, or change a live match's court (picking an occupied one swaps them).</p>
         {queue.length === 0 && <p className="note">Nothing queued -- generate and publish above.</p>}
-        <div className="courts">
-          {queue.map((m) => (
-            <QueueMatchCard key={m.id} eventId={eventId} match={m} byId={byId} players={players} matches={matches} courts={courts} reload={reload} queuePosition={queuePosition[m.id] ?? null} />
-          ))}
-        </div>
+        {live.length > 0 && (
+          <>
+            <div className="round-title">On court ({live.length})</div>
+            <div className="courts">{live.map(renderCard)}</div>
+          </>
+        )}
+        {queued.length > 0 && (
+          <div style={live.length > 0 ? { marginTop: 22, borderTop: "2px solid var(--line)" } : undefined}>
+            <div className="round-title">In the queue ({queued.length})</div>
+            <div className="courts">{queued.map(renderCard)}</div>
+          </div>
+        )}
       </div>
     </>
   );
