@@ -1,0 +1,13 @@
+-- Run this in the Supabase SQL editor for the live project, BEFORE deploying
+-- the matching code change (new code publishes matches with no court).
+--
+-- Court assignment becomes an explicit dispatch step: a published match sits
+-- in the queue with no court until the organizer assigns one, and assigning a
+-- court is what puts it live. Auto-assigning a court at publish time (cycling
+-- 1..courts by queue position) went wrong whenever a court finished early or a
+-- player was in two consecutive matches on different courts.
+--
+-- Existing rows are left alone: older events already have a court on every
+-- match, and the app reads that as "earliest unscored match per court is
+-- live, any extras are queued", so nothing needs rewriting.
+alter table matches alter column court drop not null;

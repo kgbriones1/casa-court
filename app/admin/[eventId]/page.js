@@ -4,9 +4,9 @@ import TopBar from "../../../components/TopBar";
 import {
   fetchFullEvent, subscribeEvent, importRoster, addWalkIn, setAttendance, checkInAll, checkOutPlayer,
   startEvent, endEvent, deleteEvent, publishMatches, submitScore, correctScore, cancelMatch,
-  invalidateMatch, editMatchPlayers, reassignCourt,
+  invalidateMatch, editMatchPlayers, reassignCourt, setPlayerGender,
 } from "../../../lib/db";
-import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel, groupIntoRounds, roundOf, classify, reverseMatchHistory } from "../../../lib/scheduler";
+import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel, groupIntoRounds, roundOf, classify, reverseMatchHistory, splitLiveAndQueued } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
 const ATT_COLOR = { not_arrived: "#8a8067", late: "#b58a2f", checked_in: "#2c6e3f", temporarily_unavailable: "#4C6E91", no_show: "#a83232", withdrawn: "#5b5142" };
@@ -277,7 +277,7 @@ function AdminInner({ eventId }) {
   const publish = async () => {
     setGenError(""); setBusy(true);
     try {
-      await publishMatches(eventId, draft.matches, players, event.courts);
+      await publishMatches(eventId, draft.matches, players);
       setDraft(null);
       reload();
     } catch (err) {
@@ -452,7 +452,7 @@ function AdminInner({ eventId }) {
           </>
         )}
 
-        {tab === "registrants" && <RegistrantsPanel eventId={eventId} players={players} reload={reload} />}
+        {tab === "registrants" && <RegistrantsPanel eventId={eventId} players={players} matches={matches} reload={reload} />}
 
         {tab === "checkin" && <CheckinPanel eventId={eventId} players={players} matches={matches} reload={reload} />}
 
@@ -498,10 +498,21 @@ function parseCsvText(text) {
   });
 }
 
-function RegistrantsPanel({ eventId, players, reload }) {
+function RegistrantsPanel({ eventId, players, matches, reload }) {
   const [rows, setRows] = useState([{ firstName: "", lastName: "", nickname: "", gender: "F", level: "" }]);
   const [bulk, setBulk] = useState("");
   const fileInputRef = useRef(null);
+
+  // Fixes a roster mistake (e.g. misgendered in the CSV). Gender decides which
+  // King/Queen board a player is on, so once they've played, confirm first.
+  const changeGender = (p, newGender) => {
+    if (newGender === p.gender) return;
+    const label = newGender === "female" ? "female" : "male";
+    if (p.games_played > 0 && !confirm(`${p.display_name} has ${p.games_played} game${p.games_played === 1 ? "" : "s"} played. Changing them to ${label} moves them to the ${newGender === "female" ? "Queen" : "King"} board, with their existing results.
+
+Continue?`)) return;
+    setPlayerGender(eventId, p, newGender, players, matches).then(reload).catch((err) => alert(`Couldn't update gender: ${err.message || err}`));
+  };
 
   const handleFile = (file) => {
     const reader = new FileReader();
@@ -557,7 +568,12 @@ function RegistrantsPanel({ eventId, players, reload }) {
                 <tr key={p.id}>
                   <td className="small">KQ-{String(i + 1).padStart(3, "0")}</td>
                   <td><strong>{p.display_name}</strong> <span className="small">({p.first_name} {p.last_name})</span></td>
-                  <td>{p.gender === "female" ? "F" : "M"}</td>
+                  <td>
+                    <select value={p.gender} onChange={(e) => changeGender(p, e.target.value)} aria-label={`Gender for ${p.display_name}`}>
+                      <option value="female">F</option>
+                      <option value="male">M</option>
+                    </select>
+                  </td>
                   <td>{p.level ?? "--"}</td>
                   <td>{p.games_played}</td>
                   <td>{p.registration_status === "walk_in" ? "Walk-in" : "Registered"}</td>
@@ -653,6 +669,9 @@ function LogPanel({ logs }) {
   );
 }
 
+/** A match with no court is waiting in the queue -- say so instead of "Court null". */
+const courtText = (m) => (m.court != null ? `Court ${m.court}` : "No court yet");
+
 function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
   const [a, setA] = useState(match.score_a ?? "");
   const [b, setB] = useState(match.score_b ?? "");
@@ -660,7 +679,7 @@ function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
   const name = (id) => byId[id]?.display_name || "?";
   return (
     <div className="court" style={{ borderLeft: draft ? "4px solid #5d73c7" : "4px solid #c8923e" }}>
-      <div className="label">Court {match.court} &middot; {matchTypeLabel(match, byId)}</div>
+      <div className="label">{courtText(match)} &middot; {matchTypeLabel(match, byId)}</div>
       <div className="teams">
         <div className="team">{match.team_a.map(name).join(" & ")}</div>
         <div className="vs">VS</div>
@@ -693,20 +712,14 @@ function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
   );
 }
 
-/** Current + next scheduled match per court, read straight off the flat matches
- * list -- courts no longer need to share a round, so a court simply shows the
- * earliest- and second-earliest-sequence match still awaiting a score. */
-function courtStatus(matches, courtNum, courts) {
-  const scheduled = matches
-    .filter((m) => m.court === courtNum && m.status === "scheduled")
-    .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
-    .map((m) => ({ ...m, roundNumber: m.sequence != null ? roundOf(m.sequence, courts) : null }));
-  return { current: scheduled[0] || null, next: scheduled[1] || null };
-}
-
+/** What's live on each court right now. Live = the match holds a court; the
+ * queue of matches still waiting for one is listed separately below, since
+ * assigning a court is what moves a match from the queue onto a court. */
 function CourtStatusBoard({ matches, byId, eventId, courts }) {
   if (!courts) return null;
   const name = (id) => byId[id]?.display_name || "?";
+  const { live, queued } = splitLiveAndQueued(matches);
+  const liveByCourt = Object.fromEntries(live.map((m) => [m.court, m]));
 
   return (
     <div className="card">
@@ -714,33 +727,25 @@ function CourtStatusBoard({ matches, byId, eventId, courts }) {
         <h2 style={{ flex: 1 }}>Court status</h2>
         <button className="small secondary" onClick={() => window.open(`${BASE_PATH}/live/${eventId}`, "_blank", "noopener,noreferrer")}>Open participant view</button>
       </div>
-      <p className="note" style={{ marginBottom: 10 }}>What's on each court right now, and what's already queued up next -- so a court doesn't have to sit idle waiting for others to finish. Generate and publish ahead to get it queued here.</p>
+      <p className="note" style={{ marginBottom: 10 }}>What's on each court right now. Published matches wait in the queue below with no court until you assign one -- that's what puts them live, and what participants see move from "Up next" to "Playing now".</p>
       <div className="courts">
         {Array.from({ length: courts }, (_, i) => i + 1).map((courtNum) => {
-          const { current, next } = courtStatus(matches, courtNum, courts);
+          const current = liveByCourt[courtNum];
           return (
             <div key={courtNum} className="court">
               <div className="label">Court {courtNum}</div>
               {current ? (
                 <>
-                  <p className="small" style={{ margin: "4px 0" }}>Now &middot; Round {current.roundNumber} &middot; {matchTypeLabel(current, byId)}</p>
+                  <p className="small" style={{ margin: "4px 0" }}>Now &middot; Round {roundOf(current.sequence, courts)} &middot; {matchTypeLabel(current, byId)}</p>
                   <div className="teams" style={{ fontSize: 14 }}>
                     <div className="team">{current.team_a.map(name).join(" & ")}</div>
                     <div className="vs">VS</div>
                     <div className="team" style={{ textAlign: "right" }}>{current.team_b.map(name).join(" & ")}</div>
                   </div>
                 </>
-              ) : <p className="note">Free -- nothing scheduled on this court right now.</p>}
-              {next ? (
-                <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed var(--line)" }}>
-                  <p className="small" style={{ margin: "0 0 4px", color: "var(--gold)", fontWeight: 700 }}>Next &middot; Round {next.roundNumber}</p>
-                  <div className="teams" style={{ fontSize: 13 }}>
-                    <div className="team">{next.team_a.map(name).join(" & ")}</div>
-                    <div className="vs">VS</div>
-                    <div className="team" style={{ textAlign: "right" }}>{next.team_b.map(name).join(" & ")}</div>
-                  </div>
-                </div>
-              ) : <p className="note" style={{ marginTop: 8 }}>Nothing queued yet for this court.</p>}
+              ) : (
+                <p className="note">Free{queued.length ? " -- assign the next queued match to it below." : "."}</p>
+              )}
             </div>
           );
         })}
@@ -779,6 +784,7 @@ function ManualMatchCard({ eventId, players, byId, matches, courts, reload }) {
   const [open, setOpen] = useState(false);
   const [a1, setA1] = useState(""); const [a2, setA2] = useState("");
   const [b1, setB1] = useState(""); const [b2, setB2] = useState("");
+  const [court, setCourt] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -799,9 +805,9 @@ function ManualMatchCard({ eventId, players, byId, matches, courts, reload }) {
     if (!ready) return;
     setSaving(true); setError("");
     try {
-      const match = { team_a: [a1, a2], team_b: [b1, b2], score_a: null, score_b: null, status: "scheduled", division: classify({ team_a: [a1, a2], team_b: [b1, b2] }, byId), sequence: preview.nextSequence };
-      await publishMatches(eventId, [match], players, courts);
-      setA1(""); setA2(""); setB1(""); setB2(""); setOpen(false);
+      const match = { team_a: [a1, a2], team_b: [b1, b2], score_a: null, score_b: null, status: "scheduled", division: classify({ team_a: [a1, a2], team_b: [b1, b2] }, byId), sequence: preview.nextSequence, court };
+      await publishMatches(eventId, [match], players);
+      setA1(""); setA2(""); setB1(""); setB2(""); setCourt(null); setOpen(false);
       reload();
     } catch (err) {
       setError(`Couldn't create the match: ${err.message || err}`);
@@ -845,12 +851,15 @@ function ManualMatchCard({ eventId, players, byId, matches, courts, reload }) {
           </select>
         </div>
       </div>
+      <div style={{ marginTop: 10 }}>
+        <CourtSelect value={court} onChange={setCourt} courts={courts} takenCourts={new Set(splitLiveAndQueued(matches).live.map((m) => m.court))} disableTaken />
+      </div>
       {chosen.length === 4 && !distinct && <div className="error-box">Pick 4 different players.</div>}
       {preview?.warnings.map((w, i) => <div key={i} className="warn-box">{w}</div>)}
       {error && <div className="error-box">{error}</div>}
       <div className="row" style={{ marginTop: 10 }}>
         <button disabled={!ready || saving} onClick={create}>Create match</button>
-        <button className="secondary" onClick={() => { setOpen(false); setA1(""); setA2(""); setB1(""); setB2(""); setError(""); }}>Cancel</button>
+        <button className="secondary" onClick={() => { setOpen(false); setA1(""); setA2(""); setB1(""); setB2(""); setCourt(null); setError(""); }}>Cancel</button>
       </div>
     </div>
   );
@@ -934,34 +943,62 @@ function EditPlayersForm({ eventId, match, players, byId, matches, courts, reloa
   );
 }
 
-/** One scheduled (not-yet-played) match's full Match Control controls: its
- * predicted court (editable -- a true swap with whoever else holds the target
- * court), edit-players, and cancel. */
-function QueueMatchCard({ eventId, match, byId, players, matches, courts, reload }) {
+/** Court dropdown shared by the draft, the manual builder and the queue.
+ * "Not assigned" means the match waits in the queue; picking a court puts it
+ * live there. `takenCourts` are courts another live (or drafted) match already
+ * holds -- greyed out when `disableTaken` (drafts, where a clash can't be
+ * resolved), selectable otherwise (the queue, where picking one swaps). */
+function CourtSelect({ value, onChange, courts, takenCourts, disableTaken }) {
+  return (
+    <label className="small" style={{ display: "flex", alignItems: "center", gap: 4 }}>
+      Court
+      <select value={value ?? ""} onChange={(e) => onChange(e.target.value === "" ? null : parseInt(e.target.value, 10))}>
+        <option value="">Not assigned</option>
+        {Array.from({ length: courts }, (_, i) => i + 1).map((c) => {
+          const taken = takenCourts.has(c);
+          return <option key={c} value={c} disabled={disableTaken && taken}>{`Court ${c}${taken ? " (in use)" : ""}`}</option>;
+        })}
+      </select>
+    </label>
+  );
+}
+
+/** One unscored published match's Match Control controls: its court (assigning
+ * one puts it live; picking an occupied court swaps the two), edit-players, and
+ * cancel. `queuePosition` is its place in the waiting queue, or null if it's
+ * already live on a court. */
+function QueueMatchCard({ eventId, match, byId, players, matches, courts, reload, queuePosition }) {
   const [editing, setEditing] = useState(false);
   const name = (id) => byId[id]?.display_name || "?";
+  const who = (m) => [...m.team_a, ...m.team_b].map(name).join(", ");
   const roundNumber = match.sequence != null ? roundOf(match.sequence, courts) : null;
+  const isLive = queuePosition == null;
+  const liveByCourt = Object.fromEntries(splitLiveAndQueued(matches).live.map((m) => [m.court, m]));
+  const takenCourts = new Set(Object.keys(liveByCourt).map(Number).filter((c) => liveByCourt[c].id !== match.id));
 
   const cancelWithConfirm = () => {
-    const names = [...match.team_a, ...match.team_b].map(name).join(", ");
-    const reason = prompt(`Cancel Court ${match.court} (${names})? This can't be undone from the app.\n\nOptional reason (shown in the Event Log):`, "");
+    const reason = prompt(`Cancel ${isLive ? `Court ${match.court}` : "this queued match"} (${who(match)})? This can't be undone from the app.\n\nOptional reason (shown in the Event Log):`, "");
     if (reason === null) return;
     cancelMatch(eventId, match, players, matches, reason).then(reload);
   };
 
+  const changeCourt = (newCourt) => {
+    const occupant = newCourt != null ? liveByCourt[newCourt] : null;
+    if (occupant && occupant.id !== match.id) {
+      const back = isLive ? `Court ${match.court}` : "the queue";
+      if (!confirm(`Court ${newCourt} is in use by ${who(occupant)}.\n\nSwap? They'll move to ${back}.`)) return;
+    }
+    reassignCourt(eventId, matches, players, match.id, newCourt).then(reload);
+  };
+
   return (
-    <div className="court" style={{ borderLeft: "4px solid #c8923e" }}>
+    <div className="court" style={{ borderLeft: isLive ? "4px solid #2c6e3f" : "4px solid #c8923e" }}>
       <div className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-        <div className="label" style={{ marginBottom: 0 }}>Round {roundNumber} &middot; {matchTypeLabel(match, byId)}</div>
-        <label className="small" style={{ display: "flex", alignItems: "center", gap: 4 }}>
-          Court
-          <select
-            value={match.court}
-            onChange={(e) => reassignCourt(eventId, matches, players, match.id, parseInt(e.target.value, 10)).then(reload)}
-          >
-            {Array.from({ length: courts }, (_, i) => i + 1).map((c) => <option key={c} value={c}>{c}</option>)}
-          </select>
-        </label>
+        <div>
+          <div className="label" style={{ marginBottom: 0 }}>{isLive ? `Live \u00B7 Court ${match.court}` : `Queue #${queuePosition}`}</div>
+          <div className="small">Round {roundNumber} &middot; {matchTypeLabel(match, byId)}</div>
+        </div>
+        <CourtSelect value={isLive ? match.court : null} onChange={changeCourt} courts={courts} takenCourts={takenCourts} disableTaken={false} />
       </div>
       <div className="teams">
         <div className="team">{match.team_a.map(name).join(" & ")}</div>
@@ -986,7 +1023,18 @@ function MatchControlPanel({
 }) {
   const [swapA, setSwapA] = useState("");
   const [swapB, setSwapB] = useState("");
-  const queue = matches.filter((m) => m.status === "scheduled").sort((a, b) => (a.sequence || 0) - (b.sequence || 0));
+  const { live, queued } = splitLiveAndQueued(matches);
+  const queue = [...live, ...queued];
+  const queuePosition = Object.fromEntries(queued.map((m, i) => [m.id, i + 1]));
+  const liveCourts = new Set(live.map((m) => m.court));
+
+  const setDraftCourt = (index, court) => setDraft({ ...draft, matches: draft.matches.map((m, i) => (i === index ? { ...m, court } : m)) });
+  const fillFreeCourts = () => {
+    const taken = new Set([...liveCourts, ...draft.matches.map((m) => m.court).filter((c) => c != null)]);
+    const free = Array.from({ length: courts }, (_, i) => i + 1).filter((c) => !taken.has(c));
+    let next = 0;
+    setDraft({ ...draft, matches: draft.matches.map((m) => (m.court == null && next < free.length ? { ...m, court: free[next++] } : m)) });
+  };
 
   const applySwap = () => {
     if (!swapA || !swapB || swapA === swapB) return;
@@ -1015,8 +1063,25 @@ function MatchControlPanel({
           <>
             <p className="note" style={{ fontFamily: "monospace", color: "#4C6E91" }}>DRAFT -- {draft.matches.length} MATCH{draft.matches.length === 1 ? "" : "ES"} -- NOT PUBLISHED</p>
             {draft.warnings.map((w, i) => <div key={i} className="warn-box">{w}</div>)}
+            <p className="note">No court is picked for you -- leave a match as "Not assigned" to hold it in the queue, or pick a free court now to put it live as soon as it's published.</p>
             <div className="courts">
-              {draft.matches.map((m, i) => <MatchCard key={i} byId={byId} match={{ ...m, court: ((m.sequence - 1) % courts) + 1 }} draft editable={false} />)}
+              {draft.matches.map((m, i) => (
+                <div key={i}>
+                  <MatchCard byId={byId} match={m} draft editable={false} />
+                  <div style={{ marginTop: 6 }}>
+                    <CourtSelect
+                      value={m.court ?? null}
+                      onChange={(c) => setDraftCourt(i, c)}
+                      courts={courts}
+                      takenCourts={new Set([...liveCourts, ...draft.matches.filter((_, j) => j !== i).map((x) => x.court).filter((c) => c != null)])}
+                      disableTaken
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="row" style={{ marginTop: 8 }}>
+              <button className="small secondary" onClick={fillFreeCourts} disabled={draft.matches.every((m) => m.court != null) || liveCourts.size + draft.matches.filter((m) => m.court != null).length >= courts}>Fill free courts</button>
             </div>
             {draft.sitting.length > 0 && <div className="sitout">Sitting: {draft.sitting.map((id) => byId[id]?.display_name).join(", ")}</div>}
             <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px dashed var(--line)" }}>
@@ -1048,12 +1113,12 @@ function MatchControlPanel({
       <ManualMatchCard eventId={eventId} players={players} byId={byId} matches={matches} courts={courts} reload={reload} />
 
       <div className="card">
-        <h2>Queue ({queue.length})</h2>
-        <p className="note">Published matches still awaiting a score, in the order they'll be played.</p>
+        <h2>Matches awaiting a score ({queue.length})</h2>
+        <p className="note">Matches on a court are live; the rest wait in the queue, numbered in the order they'll be called. Assign a court to put a queued match live, or change a live match's court (picking an occupied one swaps them).</p>
         {queue.length === 0 && <p className="note">Nothing queued -- generate and publish above.</p>}
         <div className="courts">
           {queue.map((m) => (
-            <QueueMatchCard key={m.id} eventId={eventId} match={m} byId={byId} players={players} matches={matches} courts={courts} reload={reload} />
+            <QueueMatchCard key={m.id} eventId={eventId} match={m} byId={byId} players={players} matches={matches} courts={courts} reload={reload} queuePosition={queuePosition[m.id] ?? null} />
           ))}
         </div>
       </div>
@@ -1082,7 +1147,7 @@ function CorrectableMatchCard({ eventId, byId, match, players, matches, courts, 
   };
   return (
     <div className="court">
-      <div className="label">Court {match.court} &middot; {matchTypeLabel(match, byId)}</div>
+      <div className="label">{courtText(match)} &middot; {matchTypeLabel(match, byId)}</div>
       <div className="teams">
         <div className="team">{match.team_a.map(name).join(" & ")}</div>
         <div className="vs">VS</div>
@@ -1126,12 +1191,11 @@ function ScoresPanel({ matches, groupedRounds, courts, byId, players, reload, ev
     .filter((r) => r.matches.length > 0)
     .reverse();
 
-  // What's already queued for this same court, if any -- so scoring this match
-  // and freeing the court doesn't mean checking Match Control separately.
-  const nextOnCourt = (m) => {
-    const later = matches.filter((mm) => mm.court === m.court && mm.status === "scheduled" && (mm.sequence || 0) > (m.sequence || 0)).sort((a, b) => a.sequence - b.sequence);
-    return later[0] || null;
-  };
+  // Scoring a live match frees its court -- show who's first in the queue so
+  // the next call doesn't mean checking Match Control separately.
+  const { live, queued } = splitLiveAndQueued(matches);
+  const liveIds = new Set(live.map((m) => m.id));
+  const nextInQueue = queued[0] || null;
   const name = (id) => byId[id]?.display_name || "?";
 
   return (
@@ -1141,14 +1205,14 @@ function ScoresPanel({ matches, groupedRounds, courts, byId, players, reload, ev
         {pending.length === 0 && <p className="note">All caught up.</p>}
         <div className="courts">
           {pending.map((m) => {
-            const next = nextOnCourt(m);
+            const next = liveIds.has(m.id) ? nextInQueue : null;
             return (
               <div key={m.id}>
                 <p className="note" style={{ marginBottom: 2 }}>Round {m.roundNumber}</p>
                 <MatchCard byId={byId} match={m} editable onScore={(a, b, status) => submitScore(m, a, b, players, status).then(reload)} />
                 {next && (
                   <p className="note" style={{ marginTop: 4 }}>
-                    Once scored, Court {m.court} is next up: {next.team_a.map(name).join(" & ")} vs {next.team_b.map(name).join(" & ")}
+                    Once scored, Court {m.court} frees up. Next in the queue: {next.team_a.map(name).join(" & ")} vs {next.team_b.map(name).join(" & ")}
                   </p>
                 )}
               </div>

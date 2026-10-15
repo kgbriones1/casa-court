@@ -2,38 +2,31 @@
 import { useEffect, useMemo, useState } from "react";
 import TopBar from "../../../components/TopBar";
 import { fetchFullEvent, subscribeEvent } from "../../../lib/db";
-import { matchTypeLabel, groupIntoRounds, roundOf } from "../../../lib/scheduler";
+import { matchTypeLabel, groupIntoRounds, roundOf, splitLiveAndQueued } from "../../../lib/scheduler";
 
 function leaderboardFor(players, gender) {
   const list = gender === "overall" ? players : players.filter((p) => p.gender === gender);
   return [...list].sort((a, b) => b.point_diff - a.point_diff);
 }
 
-/** A court's own current/next match, independent of whether its round as a whole
- * has finished -- mirrors the organizer's Match Control "Court status" exactly, so
- * a court that's already moved on to a later match (because the organizer
- * generated ahead) shows that immediately instead of still being bucketed under
- * its old, already-scored round just because some other court hasn't finished.
- * Read straight off the flat matches list -- courts no longer share a round. */
-function courtStatus(matches, courtNum, courts) {
-  const scheduled = matches
-    .filter((m) => m.court === courtNum && m.status === "scheduled")
-    .sort((a, b) => (a.sequence || 0) - (b.sequence || 0))
-    .map((m) => ({ ...m, roundNumber: m.sequence != null ? roundOf(m.sequence, courts) : null }));
-  return { current: scheduled[0] || null, next: scheduled[1] || null };
-}
-
+/** What participants see: one live match per court (with its court number),
+ * and everything else waiting in the queue in the order it'll be called --
+ * with no court. The barker assigns a court when a match is about to start,
+ * which is what moves it from the queue onto a court here, so a court number
+ * never shows up before the match is actually being called. */
 function classifyBoard(matches, courts) {
-  const courtsList = Array.from({ length: courts }, (_, i) => i + 1).map((courtNum) => ({ courtNum, ...courtStatus(matches, courtNum, courts) }));
+  const { live, queued } = splitLiveAndQueued(matches);
+  const withRound = (m) => ({ ...m, roundNumber: m.sequence != null ? roundOf(m.sequence, courts) : null });
+  const liveByCourt = Object.fromEntries(live.map((m) => [m.court, withRound(m)]));
+  const courtsList = Array.from({ length: courts }, (_, i) => i + 1).map((courtNum) => ({ courtNum, current: liveByCourt[courtNum] || null }));
+  const upNext = queued.map((m, i) => ({ ...withRound(m), position: i + 1 }));
   // A round's finished matches must show up here even if the round as a whole
   // isn't done yet (one court can finish while another in the same round is
-  // still playing) -- otherwise a court that's already moved on, per courtStatus
-  // above, leaves its just-completed match with nowhere to appear at all.
-  const groupedRounds = groupIntoRounds(matches, courts);
-  const results = groupedRounds
+  // still playing).
+  const results = groupIntoRounds(matches, courts)
     .map((r) => ({ ...r, matches: r.matches.filter((m) => m.status !== "scheduled") }))
     .filter((r) => r.matches.length > 0);
-  return { courts: courtsList, results };
+  return { courts: courtsList, upNext, results };
 }
 
 /** Estimated clock time for a round, from the event's start time and round length --
@@ -59,7 +52,7 @@ function MatchRow({ byId, m, highlightId }) {
   const involves = highlightId && [...m.team_a, ...m.team_b].includes(highlightId);
   return (
     <div className="court" style={{ outline: involves ? "3px solid #c8923e" : "none" }}>
-      <div className="label">Court {m.court} &middot; {matchTypeLabel(m, byId)}</div>
+      <div className="label">{m.court != null ? `Court ${m.court} · ` : ""}{matchTypeLabel(m, byId)}</div>
       <div className="teams">
         <div className="team">{m.team_a.map(name).join(" & ")}</div>
         <div className="vs">VS</div>
@@ -88,8 +81,7 @@ function RoundCard({ round, event, byId, highlightId, badge }) {
 }
 
 /** One court's current or next match for the Playing now / Up next sections --
- * each court gets its own card since courts can legitimately be ahead of others
- * once the organizer starts generating ahead (see courtStatus). */
+ * each court gets its own card since courts finish at different times. */
 function CourtMatchCard({ courtNum, match, event, byId, highlightId, badge }) {
   const name = (id) => byId[id]?.display_name || "?";
   if (!match) {
@@ -110,6 +102,31 @@ function CourtMatchCard({ courtNum, match, event, byId, highlightId, badge }) {
           {timeRange && <div className="round-card-time">{timeRange}</div>}
         </div>
         <span className={`badge ${badge.color}`}>{badge.label}</span>
+      </div>
+      <p className="note" style={{ margin: "0 0 6px" }}>{matchTypeLabel(match, byId)}</p>
+      <div className="teams">
+        <div className="team">{match.team_a.map(name).join(" & ")}</div>
+        <div className="vs">VS</div>
+        <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
+      </div>
+    </div>
+  );
+}
+
+/** A match waiting in the queue: position, round and match-up, deliberately
+ * with no court -- the barker calls the court out when it's about to start. */
+function QueuedMatchCard({ match, event, byId, highlightId }) {
+  const name = (id) => byId[id]?.display_name || "?";
+  const involves = highlightId && [...match.team_a, ...match.team_b].includes(highlightId);
+  const timeRange = roundTimeRange(event, match.roundNumber);
+  return (
+    <div className="court" style={{ outline: involves ? "3px solid #c8923e" : "none" }}>
+      <div className="round-card-head" style={{ marginBottom: 6 }}>
+        <div>
+          <div className="label" style={{ marginBottom: 0 }}>#{match.position} in queue &middot; Round {match.roundNumber}</div>
+          {timeRange && <div className="round-card-time">{timeRange}</div>}
+        </div>
+        <span className="badge gray">Upcoming</span>
       </div>
       <p className="note" style={{ margin: "0 0 6px" }}>{matchTypeLabel(match, byId)}</p>
       <div className="teams">
@@ -150,10 +167,10 @@ function LiveInner({ eventId }) {
   const { event, players, matches } = state;
   const byId = Object.fromEntries(players.map((p) => [p.id, p]));
   const groupedRounds = groupIntoRounds(matches, event.courts);
-  const { results, courts } = classifyBoard(matches, event.courts);
-  const activeIds = new Set(courts.flatMap((c) => (c.current ? [...c.current.team_a, ...c.current.team_b] : [])));
-  const bench = players.filter((p) => p.attendance_status === "checked_in" && !activeIds.has(p.id)).map((p) => p.display_name);
-  const courtsWithNext = courts.filter((c) => c.next);
+  const { results, courts, upNext } = classifyBoard(matches, event.courts);
+  // Anyone playing or already in the queue is accounted for above -- Resting is everyone else.
+  const busyIds = new Set([...courts.flatMap((c) => (c.current ? [c.current] : [])), ...upNext].flatMap((m) => [...m.team_a, ...m.team_b]));
+  const bench = players.filter((p) => p.attendance_status === "checked_in" && !busyIds.has(p.id)).map((p) => p.display_name);
 
   return (
     <div>
@@ -182,12 +199,13 @@ function LiveInner({ eventId }) {
                 {bench.length > 0 && <div className="sitout">Resting: {bench.join(", ")}</div>}
               </>
             )}
-            {courtsWithNext.length > 0 && (
+            {upNext.length > 0 && (
               <>
                 <div className="section-title">Up next</div>
+                <p className="note" style={{ margin: "0 0 8px" }}>Courts are called out as each match is about to start.</p>
                 <div className="courts">
-                  {courtsWithNext.map((c) => (
-                    <CourtMatchCard key={c.courtNum} courtNum={c.courtNum} match={c.next} event={event} byId={byId} highlightId={matched?.id} badge={{ label: "Upcoming", color: "gray" }} />
+                  {upNext.map((m) => (
+                    <QueuedMatchCard key={m.id} match={m} event={event} byId={byId} highlightId={matched?.id} />
                   ))}
                 </div>
               </>

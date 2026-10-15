@@ -61,7 +61,7 @@ create table matches (
     -- to -- see lib/scheduler.js. Only matches from before the per-match
     -- redesign have this set.
   event_id uuid not null references events(id) on delete cascade, -- denormalized, simplifies realtime filtering
-  court int not null,
+  court int, -- null = queued, not yet assigned; assigning a court puts the match live
   sequence int, -- monotonically increasing per event, assigned at generation time; see lib/scheduler.js
   division text not null default 'men' check (division in ('women','men','mixed','edge')),
     -- women's/men's doubles, mixed doubles, or an edge composition (uneven gender
