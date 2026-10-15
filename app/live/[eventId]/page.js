@@ -29,24 +29,6 @@ function classifyBoard(matches, courts) {
   return { courts: courtsList, upNext, results };
 }
 
-/** Estimated clock time for a round, from the event's start time and round length --
- * a planned slot (like the Match Control tab's), not a live elapsed-time stamp, since
- * real events run ahead of or behind schedule. Returns null if the event has no
- * start time or round length set. */
-function roundTimeRange(event, roundNumber) {
-  if (!event.start_time || !event.round_minutes) return null;
-  const [sh, sm] = event.start_time.split(":").map(Number);
-  const startMins = sh * 60 + sm + (roundNumber - 1) * event.round_minutes;
-  const endMins = startMins + event.round_minutes;
-  const fmt = (mins) => {
-    const h24 = Math.floor(mins / 60) % 24;
-    const m = mins % 60;
-    const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
-    return `${h12}:${String(m).padStart(2, "0")} ${h24 >= 12 ? "PM" : "AM"}`;
-  };
-  return `${fmt(startMins)} – ${fmt(endMins)}`;
-}
-
 function MatchRow({ byId, m, highlightId }) {
   const name = (id) => byId[id]?.display_name || "?";
   const involves = highlightId && [...m.team_a, ...m.team_b].includes(highlightId);
@@ -65,13 +47,11 @@ function MatchRow({ byId, m, highlightId }) {
 }
 
 function RoundCard({ round, event, byId, highlightId, badge }) {
-  const timeRange = roundTimeRange(event, round.number);
   return (
     <div className="card round-card">
       <div className="round-card-head">
         <div>
           <div className="round-card-title">Round {round.number}</div>
-          {timeRange && <div className="round-card-time">{timeRange}</div>}
         </div>
         <span className={`badge ${badge.color}`}>{badge.label}</span>
       </div>
@@ -93,13 +73,11 @@ function CourtMatchCard({ courtNum, match, event, byId, highlightId, badge }) {
     );
   }
   const involves = highlightId && [...match.team_a, ...match.team_b].includes(highlightId);
-  const timeRange = roundTimeRange(event, match.roundNumber);
   return (
     <div className="court" style={{ outline: involves ? "3px solid #c8923e" : "none" }}>
       <div className="round-card-head" style={{ marginBottom: 6 }}>
         <div>
           <div className="label" style={{ marginBottom: 0 }}>Court {courtNum} &middot; Round {match.roundNumber}</div>
-          {timeRange && <div className="round-card-time">{timeRange}</div>}
         </div>
         <span className={`badge ${badge.color}`}>{badge.label}</span>
       </div>
@@ -118,13 +96,11 @@ function CourtMatchCard({ courtNum, match, event, byId, highlightId, badge }) {
 function QueuedMatchCard({ match, event, byId, highlightId }) {
   const name = (id) => byId[id]?.display_name || "?";
   const involves = highlightId && [...match.team_a, ...match.team_b].includes(highlightId);
-  const timeRange = roundTimeRange(event, match.roundNumber);
   return (
     <div className="court" style={{ outline: involves ? "3px solid #c8923e" : "none" }}>
       <div className="round-card-head" style={{ marginBottom: 6 }}>
         <div>
           <div className="label" style={{ marginBottom: 0 }}>#{match.position} in queue &middot; Round {match.roundNumber}</div>
-          {timeRange && <div className="round-card-time">{timeRange}</div>}
         </div>
         <span className="badge gray">Upcoming</span>
       </div>
