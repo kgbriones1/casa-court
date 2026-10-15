@@ -672,10 +672,34 @@ function LogPanel({ logs }) {
 /** A match with no court is waiting in the queue -- say so instead of "Court null". */
 const courtText = (m) => (m.court != null ? `Court ${m.court}` : "No court yet");
 
-function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
-  const [a, setA] = useState(match.score_a ?? "");
-  const [b, setB] = useState(match.score_b ?? "");
+/** Score inputs + save, shared by the Scores tab and the live cards in Match
+ * Control. Both write through the same submitScore and read the same event
+ * state, so entering a score in either place updates the other. */
+function ScoreEntry({ onScore }) {
+  const [a, setA] = useState("");
+  const [b, setB] = useState("");
   const [timeExpired, setTimeExpired] = useState(false);
+  return (
+    <>
+      <div className="scorerow">
+        <input type="number" min={0} value={a} onChange={(e) => setA(e.target.value)} />
+        <span className="vs">-</span>
+        <input type="number" min={0} value={b} onChange={(e) => setB(e.target.value)} />
+        <button className="small" onClick={() => {
+          const sa = parseInt(a), sb = parseInt(b);
+          if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0 || (sa === 0 && sb === 0)) return;
+          onScore(sa, sb, timeExpired ? "time_expired" : "completed");
+        }}>Save score</button>
+      </div>
+      <label className="small" style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 6 }}>
+        <input type="checkbox" checked={timeExpired} onChange={(e) => setTimeExpired(e.target.checked)} />
+        Time expired mid-game (score stands as entered, not a completed game)
+      </label>
+    </>
+  );
+}
+
+function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
   const name = (id) => byId[id]?.display_name || "?";
   return (
     <div className="court" style={{ borderLeft: draft ? "4px solid #5d73c7" : "4px solid #c8923e" }}>
@@ -685,24 +709,7 @@ function MatchCard({ byId, match, editable, onScore, draft, onCancel }) {
         <div className="vs">VS</div>
         <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
       </div>
-      {editable && match.status === "scheduled" && (
-        <>
-          <div className="scorerow">
-            <input type="number" min={0} value={a} onChange={(e) => setA(e.target.value)} />
-            <span className="vs">-</span>
-            <input type="number" min={0} value={b} onChange={(e) => setB(e.target.value)} />
-            <button className="small" onClick={() => {
-              const sa = parseInt(a), sb = parseInt(b);
-              if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0 || (sa === 0 && sb === 0)) return;
-              onScore(sa, sb, timeExpired ? "time_expired" : "completed");
-            }}>Save score</button>
-          </div>
-          <label className="small" style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 6 }}>
-            <input type="checkbox" checked={timeExpired} onChange={(e) => setTimeExpired(e.target.checked)} />
-            Time expired mid-game (score stands as entered, not a completed game)
-          </label>
-        </>
-      )}
+      {editable && match.status === "scheduled" && <ScoreEntry onScore={onScore} />}
       {match.status === "scheduled" && onCancel && (
         <button className="small secondary" style={{ marginTop: 8, color: "#993d38" }} onClick={onCancel}>Cancel match</button>
       )}
@@ -982,6 +989,11 @@ function QueueMatchCard({ eventId, match, byId, players, matches, courts, reload
     cancelMatch(eventId, match, players, matches, reason).then(reload);
   };
 
+  // A stale window can race another one to the same score -- submitScore
+  // refuses the second, so surface why and reload to the current state.
+  const saveScore = (a, b, status) =>
+    submitScore(match, a, b, players, status).then(reload).catch((err) => { alert(err.message || err); reload(); });
+
   const changeCourt = (newCourt) => {
     const occupant = newCourt != null ? liveByCourt[newCourt] : null;
     if (occupant && occupant.id !== match.id) {
@@ -1005,6 +1017,7 @@ function QueueMatchCard({ eventId, match, byId, players, matches, courts, reload
         <div className="vs">VS</div>
         <div className="team" style={{ textAlign: "right" }}>{match.team_b.map(name).join(" & ")}</div>
       </div>
+      {isLive && <ScoreEntry onScore={saveScore} />}
       <div className="row" style={{ marginTop: 8 }}>
         <button className="small secondary" onClick={() => setEditing((v) => !v)}>{editing ? "Close" : "Edit players"}</button>
         <button className="small secondary" style={{ color: "#993d38" }} onClick={cancelWithConfirm}>Cancel match</button>
@@ -1209,7 +1222,7 @@ function ScoresPanel({ matches, groupedRounds, courts, byId, players, reload, ev
             return (
               <div key={m.id}>
                 <p className="note" style={{ marginBottom: 2 }}>Round {m.roundNumber}</p>
-                <MatchCard byId={byId} match={m} editable onScore={(a, b, status) => submitScore(m, a, b, players, status).then(reload)} />
+                <MatchCard byId={byId} match={m} editable onScore={(a, b, status) => submitScore(m, a, b, players, status).then(reload).catch((err) => { alert(err.message || err); reload(); })} />
                 {next && (
                   <p className="note" style={{ marginTop: 4 }}>
                     Once scored, Court {m.court} frees up. Next in the queue: {next.team_a.map(name).join(" & ")} vs {next.team_b.map(name).join(" & ")}
