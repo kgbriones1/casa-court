@@ -786,8 +786,14 @@ function ManualMatchCard({ eventId, players, byId, matches, courts, reload }) {
   const distinct = new Set(chosen).size === chosen.length;
   const ready = chosen.length === 4 && distinct;
   const preview = ready ? previewManualMatch(chosen, byId, matches, courts) : null;
+  // Every dropdown lists every player, including ones already picked in another
+  // slot -- filtering those out would make it impossible to pick the same
+  // person into two slots at once, which sounds right, but also blocks the
+  // in-between step of a legitimate swap (e.g. moving Carl into a slot Alice
+  // currently occupies while Alice is still selected elsewhere, until her
+  // dropdown is updated too). The `distinct` check above is what actually
+  // catches a genuine duplicate, at save time.
   const sorted = [...players].sort((x, y) => x.display_name.localeCompare(y.display_name));
-  const optionsExcluding = (except) => sorted.filter((p) => !chosen.includes(p.id) || p.id === except);
 
   const create = async () => {
     if (!ready) return;
@@ -820,22 +826,22 @@ function ManualMatchCard({ eventId, players, byId, matches, courts, reload }) {
           <p className="small" style={{ margin: "0 0 4px", fontWeight: 700 }}>Team A</p>
           <select value={a1} onChange={(e) => setA1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
             <option value="">Pick a player...</option>
-            {optionsExcluding(a1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
           <select value={a2} onChange={(e) => setA2(e.target.value)} style={{ width: "100%" }}>
             <option value="">Pick a player...</option>
-            {optionsExcluding(a2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
         </div>
         <div>
           <p className="small" style={{ margin: "0 0 4px", fontWeight: 700 }}>Team B</p>
           <select value={b1} onChange={(e) => setB1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
             <option value="">Pick a player...</option>
-            {optionsExcluding(b1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
           <select value={b2} onChange={(e) => setB2(e.target.value)} style={{ width: "100%" }}>
             <option value="">Pick a player...</option>
-            {optionsExcluding(b2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
         </div>
       </div>
@@ -850,9 +856,11 @@ function ManualMatchCard({ eventId, players, byId, matches, courts, reload }) {
   );
 }
 
-/** Inline players editor for an unscored match -- lets the organizer swap in a
- * walk-in or correct a mistaken pairing, with the same live warnings as the
- * manual match builder. Reuses editMatchPlayers's full history backtrace. */
+/** Inline players editor -- lets the organizer swap in a walk-in on an
+ * unscored match, or correct a mistaken pairing on one that's already been
+ * scored (the recorded score stays put and gets re-attributed to whichever
+ * players end up on each team). Same live warnings as the manual match
+ * builder either way. Reuses editMatchPlayers's full history/stats backtrace. */
 function EditPlayersForm({ eventId, match, players, byId, matches, courts, reload, onClose }) {
   const [a1, setA1] = useState(match.team_a[0]); const [a2, setA2] = useState(match.team_a[1]);
   const [b1, setB1] = useState(match.team_b[0]); const [b2, setB2] = useState(match.team_b[1]);
@@ -873,8 +881,13 @@ function EditPlayersForm({ eventId, match, players, byId, matches, courts, reloa
     return working;
   }, [match, players, matches]);
   const preview = distinct ? previewManualMatch(chosen, reversedById, otherMatches, courts, match.sequence) : null;
+  // Every dropdown lists every player, including ones already picked in another
+  // slot -- see the matching comment in ManualMatchCard. Without this, swapping
+  // two players who are both already in this match (the whole point of this
+  // form) is impossible: picking Carl into a slot is blocked while he's still
+  // selected elsewhere, even mid-edit. `distinct` below is what actually
+  // catches a genuine duplicate, at save time.
   const sorted = [...players].sort((x, y) => x.display_name.localeCompare(y.display_name));
-  const optionsExcluding = (except) => sorted.filter((p) => !chosen.includes(p.id) || p.id === except);
 
   const save = async () => {
     if (!distinct) return;
@@ -895,18 +908,18 @@ function EditPlayersForm({ eventId, match, players, byId, matches, courts, reloa
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         <div>
           <select value={a1} onChange={(e) => setA1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
-            {optionsExcluding(a1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
           <select value={a2} onChange={(e) => setA2(e.target.value)} style={{ width: "100%" }}>
-            {optionsExcluding(a2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
         </div>
         <div>
           <select value={b1} onChange={(e) => setB1(e.target.value)} style={{ width: "100%", marginBottom: 6 }}>
-            {optionsExcluding(b1).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
           <select value={b2} onChange={(e) => setB2(e.target.value)} style={{ width: "100%" }}>
-            {optionsExcluding(b2).map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
+            {sorted.map((p) => <option key={p.id} value={p.id}>{p.display_name}</option>)}
           </select>
         </div>
       </div>
@@ -1048,8 +1061,9 @@ function MatchControlPanel({
   );
 }
 
-function CorrectableMatchCard({ eventId, byId, match, players, matches, reload }) {
+function CorrectableMatchCard({ eventId, byId, match, players, matches, courts, reload }) {
   const [editing, setEditing] = useState(false);
+  const [editingPlayers, setEditingPlayers] = useState(false);
   const [a, setA] = useState(match.score_a);
   const [b, setB] = useState(match.score_b);
   const name = (id) => byId[id]?.display_name || "?";
@@ -1079,6 +1093,7 @@ function CorrectableMatchCard({ eventId, byId, match, players, matches, reload }
           <p className="match-score" style={{ margin: 0 }}>{match.score_a}-{match.score_b}{match.status === "time_expired" ? " (time expired)" : ""}</p>
           <span style={{ display: "flex", gap: 4 }}>
             <button className="small secondary" onClick={() => { setA(match.score_a); setB(match.score_b); setEditing(true); }}>Edit score</button>
+            <button className="small secondary" onClick={() => setEditingPlayers((v) => !v)}>{editingPlayers ? "Close" : "Edit players"}</button>
             <button className="small secondary" style={{ color: "#993d38" }} onClick={invalidate}>Invalidate</button>
           </span>
         </div>
@@ -1090,6 +1105,12 @@ function CorrectableMatchCard({ eventId, byId, match, players, matches, reload }
           <button className="small" onClick={save}>Save correction</button>
           <button className="small secondary" onClick={() => setEditing(false)}>Cancel</button>
         </div>
+      )}
+      {editingPlayers && (
+        <>
+          <p className="note" style={{ marginTop: 8 }}>The recorded score ({match.score_a}-{match.score_b}) stays the same -- it'll be re-attributed to whichever players you assign to each team below.</p>
+          <EditPlayersForm eventId={eventId} match={match} players={players} byId={byId} matches={matches} courts={courts} reload={reload} onClose={() => setEditingPlayers(false)} />
+        </>
       )}
     </div>
   );
@@ -1143,7 +1164,7 @@ function ScoresPanel({ matches, groupedRounds, courts, byId, players, reload, ev
         {scoredRounds.map((r) => (
           <div key={r.number}>
             <div className="round-title">ROUND {r.number}</div>
-            <div className="courts">{r.matches.map((m) => <CorrectableMatchCard key={m.id} eventId={eventId} byId={byId} match={m} players={players} matches={matches} reload={reload} />)}</div>
+            <div className="courts">{r.matches.map((m) => <CorrectableMatchCard key={m.id} eventId={eventId} byId={byId} match={m} players={players} matches={matches} courts={courts} reload={reload} />)}</div>
           </div>
         ))}
       </div>
