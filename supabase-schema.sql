@@ -36,6 +36,9 @@ create table players (
   points_for int not null default 0,
   points_against int not null default 0,
   point_diff int not null default 0,
+  games_baseline int not null default 0, -- late arrivals count as at par with the field from check-in; see lib/scheduler.js adjustedGames
+  checked_in_at timestamptz, -- first time checked in; marks "has arrived before"
+  arrival_sequence int not null default 0, -- match sequence the event was at on (re)arrival; waiting counts from here
   last_played_round int,
   last_played_sequence int, -- highest matches.sequence among this player's non-cancelled matches; see lib/scheduler.js
   partner_ids uuid[] not null default '{}',

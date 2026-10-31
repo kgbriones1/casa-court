@@ -6,7 +6,7 @@ import {
   startEvent, endEvent, deleteEvent, publishMatches, submitScore, correctScore, cancelMatch,
   invalidateMatch, editMatchPlayers, reassignCourt, setPlayerGender,
 } from "../../../lib/db";
-import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel, groupIntoRounds, roundOf, classify, reverseMatchHistory, splitLiveAndQueued } from "../../../lib/scheduler";
+import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel, groupIntoRounds, roundOf, classify, reverseMatchHistory, splitLiveAndQueued, adjustedGames } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
 const ATT_COLOR = { not_arrived: "#8a8067", late: "#b58a2f", checked_in: "#2c6e3f", temporarily_unavailable: "#4C6E91", no_show: "#a83232", withdrawn: "#5b5142" };
@@ -91,21 +91,21 @@ function auditReport(players, groupedRounds) {
   });
 
   const played = players.filter((p) => p.games_played > 0);
-  const counts = played.map((p) => p.games_played);
+  const counts = played.map(adjustedGames);
   // "Typical" = the most common games_played count, not min/max -- with attendance
   // changes (late arrivals, early checkouts) in the mix, mode is a much more honest
   // baseline than the raw spread for "what a fully-present player should have."
   const typical = counts.length
     ? [...counts.reduce((m, v) => m.set(v, (m.get(v) || 0) + 1), new Map()).entries()].sort((a, b) => b[1] - a[1])[0][0]
     : null;
-  const outliers = typical == null ? [] : played.filter((p) => Math.abs(p.games_played - typical) > 1);
+  const outliers = typical == null ? [] : played.filter((p) => Math.abs(adjustedGames(p) - typical) > 1);
   // Currently checked_in players have no attendance-based excuse to be off-pace --
   // that's a real balance problem worth failing on. Anyone else (late, withdrawn,
   // temporarily_unavailable, no_show) plausibly missed rounds for a legitimate
   // reason, so it's downgraded to a warning naming them, not a failure.
   const unexplained = outliers.filter((p) => p.attendance_status === "checked_in");
   const explained = outliers.filter((p) => p.attendance_status !== "checked_in");
-  const describe = (p) => `${p.display_name} (${p.games_played}, ${ATT_LABEL[p.attendance_status]})`;
+  const describe = (p) => `${p.display_name} (${p.games_played}${p.games_baseline > 0 ? `, joined at ${p.games_baseline}` : ""}, ${ATT_LABEL[p.attendance_status]})`;
   const findingParts = [];
   if (unexplained.length) findingParts.push(`${unexplained.length} currently checked-in player(s) more than 1 game off the typical ${typical} with no attendance explanation: ${unexplained.map(describe).join(", ")}`);
   if (explained.length) findingParts.push(`${explained.length} more off-pace but explained by attendance status: ${explained.map(describe).join(", ")}`);
@@ -134,7 +134,7 @@ function auditReport(players, groupedRounds) {
     finding: totalOpponentPairs === 0 ? "No matches yet." : `${repeatedOpponents} repeated opponent pairing(s) out of ${totalOpponentPairs}.`,
   });
 
-  const avg = (arr) => (arr.length ? arr.reduce((s, p) => s + p.games_played, 0) / arr.length : 0);
+  const avg = (arr) => (arr.length ? arr.reduce((s, p) => s + adjustedGames(p), 0) / arr.length : 0);
   const womenPlayed = played.filter((p) => p.gender === "female");
   const menPlayed = played.filter((p) => p.gender === "male");
   rows.push({
@@ -197,18 +197,68 @@ function pacingReport(players, matches, courts) {
       [...m.team_a, ...m.team_b].forEach((id) => { if (sequencesById.has(id)) sequencesById.get(id).push(m.sequence); });
     });
 
+  // Everyone who is, or has been, in play -- not only players with enough games
+  // for an average break -- so under-played players are visible too.
   return players
+    .filter((p) => p.attendance_status === "checked_in" || p.attendance_status === "temporarily_unavailable" || p.games_played > 0)
     .map((p) => {
       const seqs = (sequencesById.get(p.id) || []).sort((a, b) => a - b);
       const gaps = [];
       for (let i = 1; i < seqs.length; i++) gaps.push(Math.max(0, roundOf(seqs[i], courts) - roundOf(seqs[i - 1], courts) - 1));
-      const avgBreak = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : 0;
-      return { id: p.id, display_name: p.display_name, attendance_status: p.attendance_status, games_played: p.games_played, avgBreak, hasHistory: gaps.length > 0 };
-    })
-    .sort((a, b) => b.avgBreak - a.avgBreak);
+      const avgBreak = gaps.length ? gaps.reduce((a, b) => a + b, 0) / gaps.length : null;
+      return { id: p.id, display_name: p.display_name, attendance_status: p.attendance_status, games_played: p.games_played, games_baseline: p.games_baseline || 0, avgBreak };
+    });
 }
 
 const PACE_COLOR = (avgBreak) => (avgBreak >= 2 ? "#a83232" : avgBreak >= 1 ? "#b58a2f" : "#2c6e3f");
+
+/** The pacing table, sortable by clicking a column heading. Defaults to fewest
+ * games first, so whoever is behind is at the top when an organizer is
+ * evening things out late in an event. A player without an average break yet
+ * (fewer than two games) sorts last on that column either way. */
+function PacingCard({ rows }) {
+  const [sort, setSort] = useState({ key: "games", dir: "asc" });
+  const toggle = (key) => setSort((cur) => (cur.key === key ? { key, dir: cur.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" }));
+  const mul = sort.dir === "asc" ? 1 : -1;
+  const sorted = [...rows].sort((a, b) => {
+    if (sort.key === "name") return mul * a.display_name.localeCompare(b.display_name);
+    const av = sort.key === "games" ? a.games_played : a.avgBreak;
+    const bv = sort.key === "games" ? b.games_played : b.avgBreak;
+    if (av == null && bv == null) return a.display_name.localeCompare(b.display_name);
+    if (av == null) return 1;
+    if (bv == null) return -1;
+    return mul * (av - bv) || a.display_name.localeCompare(b.display_name);
+  });
+  const arrow = (key) => (sort.key === key ? (sort.dir === "asc" ? " \u25B2" : " \u25BC") : "");
+  const heading = (key, label) => (
+    <th onClick={() => toggle(key)} style={{ cursor: "pointer", userSelect: "none" }} aria-sort={sort.key === key ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}>{label}{arrow(key)}</th>
+  );
+  return (
+    <div className="card">
+      <h2>Player pacing</h2>
+      <p className="note">Games played and average break length (in round-equivalents) between each player's own matches -- green 0&ndash;1, orange 1&ndash;2, red 2+ (at risk of an unacceptable break of 3). Click a column heading to sort. A late arrival shows the game count they joined at.</p>
+      {rows.length === 0 ? (
+        <p className="note">Check players in to see pacing data.</p>
+      ) : (
+        <div className="tablewrap">
+          <table>
+            <thead><tr>{heading("name", "Player")}<th>Status</th>{heading("games", "Games")}{heading("break", "Avg. break")}</tr></thead>
+            <tbody>
+              {sorted.map((p) => (
+                <tr key={p.id}>
+                  <td>{p.display_name}{p.games_baseline > 0 && <span className="small"> &middot; joined at {p.games_baseline}</span>}</td>
+                  <td><span className="badge gray">{ATT_LABEL[p.attendance_status]}</span></td>
+                  <td>{p.games_played}</td>
+                  <td style={p.avgBreak == null ? undefined : { color: PACE_COLOR(p.avgBreak), fontWeight: 800 }}>{p.avgBreak == null ? "--" : p.avgBreak.toFixed(1)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
 
 const AUDIT_BADGE = { pass: "green", warn: "amber", fail: "red", "n/a": "gray" };
 
@@ -359,29 +409,7 @@ function AdminInner({ eventId }) {
               })}
             </div>
 
-            <div className="card">
-              <h2>Player pacing</h2>
-              <p className="note">Games played and average break length (in round-equivalents) between each player's own matches -- green 0&ndash;1, orange 1&ndash;2, red 2+ (at risk of an unacceptable break of 3).</p>
-              {pacing.every((p) => !p.hasHistory) ? (
-                <p className="note">Publish and play at least two rounds to see pacing data.</p>
-              ) : (
-                <div className="tablewrap">
-                  <table>
-                    <thead><tr><th>Player</th><th>Status</th><th>Games</th><th>Avg. break</th></tr></thead>
-                    <tbody>
-                      {pacing.filter((p) => p.hasHistory).map((p) => (
-                        <tr key={p.id}>
-                          <td>{p.display_name}</td>
-                          <td><span className="badge gray">{ATT_LABEL[p.attendance_status]}</span></td>
-                          <td>{p.games_played}</td>
-                          <td style={{ color: PACE_COLOR(p.avgBreak), fontWeight: 800 }}>{p.avgBreak.toFixed(1)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
+            <PacingCard rows={pacing} />
 
             <div className="card">
               <h2>Match composition</h2>
@@ -599,7 +627,7 @@ function CheckinPanel({ eventId, players, matches, reload }) {
       <div className="card">
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
           <h2 style={{ flex: 1 }}>Check-in ({checkedInCount}/{players.length})</h2>
-          <button className="small" disabled={!pendingCount} onClick={() => checkInAll(eventId, players).then(reload)}>Check in all</button>
+          <button className="small" disabled={!pendingCount} onClick={() => checkInAll(eventId, players, matches).then(reload)}>Check in all</button>
         </div>
         <div className="tablewrap">
           <table>
@@ -611,6 +639,7 @@ function CheckinPanel({ eventId, players, matches, reload }) {
                   <td>
                     <strong>{p.display_name}</strong>
                     {p.registration_status === "walk_in" && <Pill color="#c8923e" style={{ marginLeft: 6 }}>Walk-in</Pill>}
+                    {p.games_baseline > 0 && <Pill color="#4C6E91" style={{ marginLeft: 6 }}>Joined at {p.games_baseline}</Pill>}
                   </td>
                   <td>{p.gender === "female" ? "F" : "M"}</td>
                   <td style={{ color: ATT_COLOR[p.attendance_status], fontWeight: 800 }}>
@@ -619,7 +648,7 @@ function CheckinPanel({ eventId, players, matches, reload }) {
                   <td>{p.games_played}</td>
                   <td>
                     <span style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                      <button className="small" disabled={p.attendance_status === "checked_in"} onClick={() => setAttendance(eventId, p.id, p.display_name, "checked_in").then(reload)}>Check in</button>
+                      <button className="small" disabled={p.attendance_status === "checked_in"} onClick={() => setAttendance(eventId, p.id, p.display_name, "checked_in", "", players, matches).then(reload)}>Check in</button>
                       <button className="small secondary" disabled={p.attendance_status === "late"} onClick={() => { const note = prompt("ETA for " + p.display_name, p.eta_note) || ""; setAttendance(eventId, p.id, p.display_name, "late", note).then(reload); }}>Late</button>
                       <button className="small secondary" disabled={p.attendance_status === "temporarily_unavailable"} onClick={() => setAttendance(eventId, p.id, p.display_name, "temporarily_unavailable").then(reload)}>Unavailable</button>
                       <button className="small secondary" disabled={p.attendance_status === "no_show"} onClick={() => setAttendance(eventId, p.id, p.display_name, "no_show").then(reload)}>No-show</button>
@@ -644,7 +673,7 @@ function CheckinPanel({ eventId, players, matches, reload }) {
           <input type="number" step="0.5" placeholder="Lvl" value={walkIn.level} onChange={(e) => setWalkIn({ ...walkIn, level: e.target.value })} />
           <button className="small secondary" onClick={async () => {
             if (!walkIn.firstName.trim()) return;
-            await addWalkIn(eventId, walkIn);
+            await addWalkIn(eventId, walkIn, players, matches);
             setWalkIn({ firstName: "", lastName: "", nickname: "", gender: "F", level: "" });
             reload();
           }}>Add walk-in</button>
