@@ -267,6 +267,7 @@ function AdminInner({ eventId }) {
   const [tab, setTab] = useState("dashboard");
   const [draft, setDraft] = useState(null); // {matches, sitting, warnings, nextSequence}
   const [matchCount, setMatchCount] = useState(null);
+  const [category, setCategory] = useState("auto"); // auto | women | men | mixed
   const [genError, setGenError] = useState("");
   const [busy, setBusy] = useState(false);
   const [origin, setOrigin] = useState("");
@@ -312,7 +313,7 @@ function AdminInner({ eventId }) {
   const generate = async () => {
     setGenError(""); setBusy(true);
     try {
-      const res = generateDraft(players, matches, effectiveMatchCount, event.courts);
+      const res = generateDraft(players, matches, effectiveMatchCount, event.courts, new Set(), { category });
       if (res.error) { setGenError(res.error); return; }
       setDraft(res);
     } finally {
@@ -490,6 +491,7 @@ function AdminInner({ eventId }) {
             generate={generate} publish={publish} byId={byId}
             matches={matches} groupedRounds={groupedRounds} courts={event.courts}
             matchCount={effectiveMatchCount} setMatchCount={setMatchCount}
+            category={category} setCategory={setCategory}
             eligiblePool={eligiblePool} eligibleFemale={eligibleFemale} eligibleMale={eligibleMale}
             eventId={eventId} players={players} reload={reload}
           />
@@ -1060,7 +1062,7 @@ function QueueMatchCard({ eventId, match, byId, players, matches, courts, reload
 
 function MatchControlPanel({
   draft, setDraft, genError, busy, generate, publish, byId,
-  matches, groupedRounds, courts, matchCount, setMatchCount,
+  matches, groupedRounds, courts, matchCount, setMatchCount, category, setCategory,
   eligiblePool, eligibleFemale, eligibleMale, eventId, players, reload,
 }) {
   const [swapA, setSwapA] = useState("");
@@ -1097,11 +1099,22 @@ function MatchControlPanel({
         <h2>Generate matches</h2>
         {!draft && (
           <>
-            <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible right now ({eligibleFemale + eligibleMale} total). Matchmaking is gender-blind and real-time -- it only ever excludes someone currently in an unscored match or back-to-back from their last one.</p>
-            <label className="small" style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
-              Matches to generate
-              <input type="number" min={1} max={20} value={matchCount} onChange={(e) => setMatchCount(Math.max(1, parseInt(e.target.value, 10) || 1))} style={{ width: 70 }} />
-            </label>
+            <p className="note" style={{ marginBottom: 10 }}>{eligibleFemale} women, {eligibleMale} men eligible right now ({eligibleFemale + eligibleMale} total). Who plays is real-time and fair -- it only ever excludes someone currently in an unscored match or back-to-back from their last one. On Auto, women's-only matches are favored (about a third of women's games) and mixed-vs-single-gender matches are avoided; pick a match type to force one.</p>
+            <div className="row" style={{ marginBottom: 10, alignItems: "center" }}>
+              <label className="small" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                Matches to generate
+                <input type="number" min={1} max={20} value={matchCount} onChange={(e) => setMatchCount(Math.max(1, parseInt(e.target.value, 10) || 1))} style={{ width: 70 }} />
+              </label>
+              <label className="small" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                Match type
+                <select value={category} onChange={(e) => setCategory(e.target.value)}>
+                  <option value="auto">Auto</option>
+                  <option value="women">Women's doubles</option>
+                  <option value="men">Men's doubles</option>
+                  <option value="mixed">Mixed doubles</option>
+                </select>
+              </label>
+            </div>
           </>
         )}
         {draft ? (
