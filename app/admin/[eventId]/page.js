@@ -6,6 +6,7 @@ import {
   startEvent, endEvent, deleteEvent, publishMatches, submitScore, correctScore, cancelMatch,
   invalidateMatch, editMatchPlayers, reassignCourt, setPlayerGender,
 } from "../../../lib/db";
+import { scoreProblem, MAX_SCORE } from "../../../lib/scores";
 import { generateDraft, swapPlayers, eligiblePlayers, matchTypeLabel, groupIntoRounds, roundOf, classify, reverseMatchHistory, splitLiveAndQueued, adjustedGames } from "../../../lib/scheduler";
 
 const ATT_LABEL = { not_arrived: "Not arrived", late: "Late", checked_in: "Checked in", temporarily_unavailable: "Temp. unavailable", no_show: "No-show", withdrawn: "Checked out" };
@@ -710,18 +711,21 @@ function ScoreEntry({ onScore }) {
   const [a, setA] = useState("");
   const [b, setB] = useState("");
   const [timeExpired, setTimeExpired] = useState(false);
+  const [problem, setProblem] = useState("");
   return (
     <>
       <div className="scorerow">
-        <input type="number" min={0} value={a} onChange={(e) => setA(e.target.value)} />
+        <input type="number" min={0} max={MAX_SCORE} value={a} onChange={(e) => { setA(e.target.value); setProblem(""); }} />
         <span className="vs">-</span>
-        <input type="number" min={0} value={b} onChange={(e) => setB(e.target.value)} />
+        <input type="number" min={0} max={MAX_SCORE} value={b} onChange={(e) => { setB(e.target.value); setProblem(""); }} />
         <button className="small" onClick={() => {
           const sa = parseInt(a), sb = parseInt(b);
-          if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0 || (sa === 0 && sb === 0)) return;
+          const bad = scoreProblem(sa, sb);
+          if (bad) { setProblem(bad); return; }
           onScore(sa, sb, timeExpired ? "time_expired" : "completed");
         }}>Save score</button>
       </div>
+      {problem && <div className="error-box" style={{ marginTop: 6 }}>{problem}</div>}
       <label className="small" style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 6 }}>
         <input type="checkbox" checked={timeExpired} onChange={(e) => setTimeExpired(e.target.checked)} />
         Time expired mid-game (score stands as entered, not a completed game)
@@ -1197,11 +1201,15 @@ function CorrectableMatchCard({ eventId, byId, match, players, matches, courts, 
   const [a, setA] = useState(match.score_a);
   const [b, setB] = useState(match.score_b);
   const name = (id) => byId[id]?.display_name || "?";
+  const [problem, setProblem] = useState("");
   const save = () => {
     const sa = parseInt(a), sb = parseInt(b);
-    if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0 || (sa === 0 && sb === 0)) return;
+    const bad = scoreProblem(sa, sb);
+    if (bad) { setProblem(bad); return; }
     if (sa === match.score_a && sb === match.score_b) { setEditing(false); return; }
-    correctScore(match, match.score_a, match.score_b, sa, sb, players).then(() => { setEditing(false); reload(); });
+    correctScore(match, match.score_a, match.score_b, sa, sb, players)
+      .then(() => { setProblem(""); setEditing(false); reload(); })
+      .catch((err) => setProblem(err.message || String(err)));
   };
   const invalidate = () => {
     const names = [...match.team_a, ...match.team_b].map(name).join(", ");
@@ -1229,13 +1237,14 @@ function CorrectableMatchCard({ eventId, byId, match, players, matches, courts, 
         </div>
       ) : (
         <div className="scorerow">
-          <input type="number" min={0} value={a} onChange={(e) => setA(e.target.value)} />
+          <input type="number" min={0} max={MAX_SCORE} value={a} onChange={(e) => { setA(e.target.value); setProblem(""); }} />
           <span className="vs">-</span>
-          <input type="number" min={0} value={b} onChange={(e) => setB(e.target.value)} />
+          <input type="number" min={0} max={MAX_SCORE} value={b} onChange={(e) => { setB(e.target.value); setProblem(""); }} />
           <button className="small" onClick={save}>Save correction</button>
-          <button className="small secondary" onClick={() => setEditing(false)}>Cancel</button>
+          <button className="small secondary" onClick={() => { setEditing(false); setProblem(""); }}>Cancel</button>
         </div>
       )}
+      {problem && <div className="error-box" style={{ marginTop: 6 }}>{problem}</div>}
       {editingPlayers && (
         <>
           <p className="note" style={{ marginTop: 8 }}>The recorded score ({match.score_a}-{match.score_b}) stays the same -- it'll be re-attributed to whichever players you assign to each team below.</p>
